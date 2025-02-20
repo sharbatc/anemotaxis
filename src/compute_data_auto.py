@@ -14,7 +14,6 @@ import time
 from functools import wraps
 import re
 ### To put in a new file with all
-
 # name_columns = ["time","id","persistence","speed","midline","loc_x","loc_y","vel_x","vel_y","orient","pathlen"]
 #directory to store the computed data
 
