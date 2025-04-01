@@ -218,7 +218,7 @@ def plot_navigational_index_histogram(ni_dict, bins=20, density=True, fit_distri
 
 
 def plot_navigational_index_time_series_single(ni_df, larva_id, window_size=5):
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(8, 6))
     
     # Apply rolling window average
     ni_df["NI_smooth"] = ni_df["NI"].rolling(window=window_size, min_periods=1).mean()
