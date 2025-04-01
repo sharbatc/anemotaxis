@@ -1,6 +1,7 @@
 *.egg-info
-data
+data/
 src/__pycache__
 results
 env/
 .vscode/
+.DS_Store
