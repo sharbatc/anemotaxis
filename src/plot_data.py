@@ -5,6 +5,15 @@ import ipywidgets as widgets
 from IPython.display import display
 from mpl_toolkits.mplot3d import Axes3D
 
+import os
+import pandas as pd
+from matplotlib import cm 
+
+from matplotlib import animation
+plt.style.use('../anemotaxis.mplstyle')
+from IPython.display import display
+import ipywidgets as widgets
+
 def plot_larva_data(larva_data, larva_id, style_path=None):
     """Plots speed, midline, vel_x, and vel_y over time for a single larva.
     
