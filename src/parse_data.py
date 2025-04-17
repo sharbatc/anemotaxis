@@ -88,6 +88,24 @@ def extract_larva_data(file_path, columns=["time", "speed", "length", "curvature
     df = pd.read_csv(file_path, sep=r"\s+", names=columns, header=None)
     return df
 
+def get_all_larva_ids(data_folder):
+    """Extract all larva IDs from the data files in a folder.
+    
+    Args:
+        data_folder (str): Path to the folder containing .dat files
+        
+    Returns:
+        list: Sorted list of all larva IDs
+    """
+    larva_ids = []
+    
+    for file in os.listdir(data_folder):
+        if file.endswith(".dat"):
+            _, larva_number = parse_filename(file)
+            larva_ids.append(larva_number)
+    
+    return sorted(larva_ids)
+
 def compute_summary(df, columns):
     """Computes summary statistics for each variable in the larva data.
     
@@ -212,42 +230,27 @@ def compute_navigational_index(larvae_data, ax="x"):
     return ni_dict
 
 def determine_pca_components(data, variance_threshold=0.95):
-    """Determines the optimal number of PCA components based on explained variance.
-    
-    Args:
-        data (pd.DataFrame): DataFrame containing the standardized data.
-        variance_threshold (float, optional): Threshold for cumulative explained variance. Defaults to 0.95.
-    
-    Returns:
-        int: Optimal number of PCA components.
-    """
+    """Determines the optimal number of PCA components based on explained variance."""
     pca = PCA()
     pca.fit(data)
     cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
     optimal_components = np.argmax(cumulative_variance >= variance_threshold) + 1
     
-    # Plot explained variance
-    plt.figure(figsize=(8, 5))
-    plt.plot(cumulative_variance, marker='o')
+    # Create single plot
+    plt.figure(figsize=(6, 4))
+    plt.plot(cumulative_variance, marker='o', markersize=4)
     plt.axhline(y=variance_threshold, color='r', linestyle='--')
     plt.xlabel('Number of Components')
     plt.ylabel('Cumulative Explained Variance')
-    plt.title('Explained Variance by Number of PCA Components')
-    plt.grid(False)  # Ensure grid is not shown
+    plt.title('PCA Components Analysis')
+    plt.grid(False)
+    plt.tight_layout()
     plt.show()
     
     return optimal_components
 
 def determine_kmeans_clusters(data, max_clusters=10):
-    """Determines the optimal number of K-means clusters using the Elbow method and Silhouette score.
-    
-    Args:
-        data (pd.DataFrame): DataFrame containing the PCA-reduced data.
-        max_clusters (int, optional): Maximum number of clusters to consider. Defaults to 10.
-    
-    Returns:
-        int: Optimal number of K-means clusters.
-    """
+    """Determines the optimal number of K-means clusters."""
     inertia = []
     silhouette_scores = []
     cluster_range = range(2, max_clusters + 1)
@@ -258,26 +261,27 @@ def determine_kmeans_clusters(data, max_clusters=10):
         inertia.append(kmeans.inertia_)
         silhouette_scores.append(silhouette_score(data, cluster_labels))
     
-    # Plot Elbow method
-    plt.figure(figsize=(8, 5))
-    plt.plot(cluster_range, inertia, marker='o')
-    plt.xlabel('Number of Clusters')
-    plt.ylabel('Inertia')
-    plt.title('Elbow Method for Optimal Number of Clusters')
-    plt.grid(False)  # Ensure grid is not shown
-    plt.show()
+    # Create side-by-side plots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
     
-    # Plot Silhouette scores
-    plt.figure(figsize=(8, 5))
-    plt.plot(cluster_range, silhouette_scores, marker='o')
-    plt.xlabel('Number of Clusters')
-    plt.ylabel('Silhouette Score')
-    plt.title('Silhouette Scores for Optimal Number of Clusters')
-    plt.grid(False)  # Ensure grid is not shown
+    # Elbow plot
+    ax1.plot(cluster_range, inertia, marker='o', markersize=4)
+    ax1.set_xlabel('Number of Clusters')
+    ax1.set_ylabel('Inertia')
+    ax1.set_title('Elbow Method')
+    ax1.grid(False)
+    
+    # Silhouette plot
+    ax2.plot(cluster_range, silhouette_scores, marker='o', markersize=4)
+    ax2.set_xlabel('Number of Clusters')
+    ax2.set_ylabel('Silhouette Score')
+    ax2.set_title('Silhouette Analysis')
+    ax2.grid(False)
+    
+    plt.tight_layout()
     plt.show()
     
     optimal_clusters = cluster_range[np.argmax(silhouette_scores)]
-    
     return optimal_clusters
 
 def cluster_behaviors(larva_data, variance_threshold=0.95, max_clusters=10):
