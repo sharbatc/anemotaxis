@@ -174,20 +174,19 @@ def plot_single_trajectory(data, larva_id):
     update_plot({'name': 'value', 'new': time[0]})
 
 
-def plot_multiple_trajectories(data, larva_ids=None):
-    """Plot multiple larval trajectories with interactive time slider."""
+def plot_multiple_trajectories(data, larva_ids=None, output_path='trajectory_animation.mp4'):
+    """Plot multiple larval trajectories with interactive time slider and save as video."""
     plt.ioff()
     
     if larva_ids is None:
         larva_ids = list(data.keys())
     
     # Create figure with square-like aspect ratio
-    fig = plt.figure(figsize=(12, 6))  # Make height equal to width
-    main_ax = plt.axes([0.1, 0.15, 0.8, 0.75])
+    fig = plt.figure(figsize=(6,6))  # Make height equal to width
+    main_ax = plt.axes([0, 0.15, 0.9, 0.75])
     cbar_height = 0.6
     cbar_y = 0.15 + (0.75 - cbar_height)/2
-    cbar_ax = plt.axes([0.92, cbar_y, 0.02, cbar_height])
-    
+    cbar_ax = plt.axes([0.80, cbar_y, 0.02, cbar_height])
     
     # Find global time range and store larval data
     max_time = 0
@@ -209,9 +208,8 @@ def plot_multiple_trajectories(data, larva_ids=None):
         y_min = min(y_min, np.min(traj['y']))
         y_max = max(y_max, np.max(traj['y']))
     
-    
     # Set axis limits
-    main_ax.set_xlim(-30, 130)
+    main_ax.set_xlim(-30, 80)
     main_ax.set_ylim(0, 200)
  
     # After plotting trajectories but before the colorbar, add vertical line
@@ -221,7 +219,7 @@ def plot_multiple_trajectories(data, larva_ids=None):
     arrow_y_positions = np.linspace(20, 180, 10)  # 10 arrows along y-axis
     arrow_length = 5  # Length of arrow in data units
     for y_pos in arrow_y_positions:
-        main_ax.arrow(100, y_pos, -arrow_length, 0,
+        main_ax.arrow(70, y_pos, -arrow_length, 0,
                     head_width=3,      
                     head_length=4,    
                     width=0.5,         # Add width to make arrow shaft thicker
@@ -231,13 +229,12 @@ def plot_multiple_trajectories(data, larva_ids=None):
                     overhang=0.3) 
     
     # Add text for wind direction
-    # Add text for wind direction
-    main_ax.text(110, 90, 'Air direction', color='blue', 
+    main_ax.text(70, 80, 'Wind direction', color='blue', 
                 rotation=-90,  # Rotate text 90 degrees counterclockwise
                 ha='center',   # Horizontal alignment
                 va='bottom',   # Vertical alignment
                 alpha=0.7,
-                fontsize=20)   # Adjust font size if needed
+                fontsize=15)   # Adjust font size if needed
     
     # Define marker colors for different larvae
     marker_colors = plt.cm.Set2(np.linspace(0, 1, len(larva_ids)))
@@ -266,35 +263,6 @@ def plot_multiple_trajectories(data, larva_ids=None):
                     color=marker_colors[i], fontsize=10)
     
     plt.colorbar(lc, cax=cbar_ax, label='Time (s)')
-
-    
-    # Create time slider
-    slider_width = f"{int(fig.get_figwidth() * 80)}px"
-    time_slider = widgets.FloatSlider(
-        value=0,
-        min=0,
-        max=max_time,
-        step=max_time/500,
-        description='Time (s):',
-        style={'description_width': 'initial'},
-        readout_format='.1f',
-        layout=widgets.Layout(width=slider_width)
-    )
-    
-    def update_plot(change):
-        if change['name'] == 'value':
-            current_time = change['new']
-            
-            for larva_id, marker in markers.items():
-                traj = trajectories[larva_id]
-                time_index = np.searchsorted(traj['time'], current_time)
-                if time_index < len(traj['time']):
-                    marker.set_data([traj['x'][time_index]], [traj['y'][time_index]])
-                else:
-                    marker.set_data([], [])
-            
-            main_ax.set_title(f'Larval Trajectories (Time: {current_time:.1f}s)')
-            fig.canvas.draw_idle()
     
     # Set axes properties
     main_ax.set_aspect('equal')
@@ -302,15 +270,27 @@ def plot_multiple_trajectories(data, larva_ids=None):
     main_ax.set_ylabel('Y Position')
     main_ax.grid(False)
     
-    # Connect events
-    time_slider.observe(update_plot)
+    # Animation function
+    def update_frame(time):
+        for larva_id, marker in markers.items():
+            traj = trajectories[larva_id]
+            time_index = np.searchsorted(traj['time'], time)
+            if time_index < len(traj['time']):
+                marker.set_data([traj['x'][time_index]], [traj['y'][time_index]])
+            else:
+                marker.set_data([], [])
+        
+        main_ax.set_title(f'Larval Trajectories (Time: {time:.1f}s)')
+        return tuple(markers.values()) + (main_ax,)
     
-    # Display slider and figure
-    display(time_slider)
-    display(fig.canvas)
+    # Create animation
+    ani = animation.FuncAnimation(fig, update_frame, frames=np.linspace(0, max_time, 500), blit=True)
     
-    # Initialize plot
-    update_plot({'name': 'value', 'new': 0})
+    # Save animation as video
+    ani.save(output_path, writer='ffmpeg', fps=30)
+    
+    plt.close(fig)  # Close the figure to prevent display in notebook
+    print(f"Animation saved to {output_path}")
 
 def plot_clusters(data, larva_id, n_components=3):
     """Plots the clusters on the PCA-reduced data.
