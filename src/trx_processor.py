@@ -5,6 +5,8 @@ import h5py
 import numpy as np
 from tqdm.notebook import tqdm
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
 from scipy.stats import gaussian_kde
 plt.style.use('../anemotaxis.mplstyle')
 
@@ -113,6 +115,7 @@ def process_single_file(file_path, show_progress=False):
                     # Head & Tail Velocity data
                     larva['head_velocity_norm_smooth_5'] = get_array('head_velocity_norm_smooth_5')  # (steps,)
                     larva['tail_velocity_norm_smooth_5'] = get_array('tail_velocity_norm_smooth_5')  # (steps,)
+                    larva['motion_velocity_norm_smooth_5'] = get_array('motion_velocity_norm_smooth_5')  # (steps,)
                     larva['angle_upper_lower_smooth_5'] = get_array('angle_upper_lower_smooth_5')  # (steps,)
                     larva['angle_downer_upper_smooth_5'] = get_array('angle_downer_upper_smooth_5')  # (steps,)
                     
@@ -3746,33 +3749,674 @@ def analyze_perpendicular_cast_directions_new(trx_data, angle_width=5, min_frame
         'angle_width': angle_width
     }
 
-def plot_larva_angle_dynamics(trx_data, larva_id=None, smooth_window=5, highlight_peaks=True, peak_prominence=None, peak_distance=20):
+def plot_filtered_angles(trx_data, larva_id=None, smooth_window=5, jump_threshold=15):
     """
-    Plot complete angle dynamics over time for a larva with behavior states highlighted,
-    including several angle calculations:
-    1. Neck angle: signed angle between tail-to-neck and neck-to-head vectors
-       (positive = bend to the right, negative = bend to the left)
-    2. Center angle: signed angle between tail-to-center and center-to-head vectors
-       (positive = bend to the right, negative = bend to the left)
-    3. Orientation angle: angle between tail-to-center vector and negative x-axis (0-360°)
-       0° = aligned with negative x-axis, 180° = aligned with positive x-axis
-       +90° = pointing right (y-axis), -90° = pointing left (negative y-axis)
-    4. Upper-lower angle: pre-calculated angle between upper and lower body segments
+    Plot orientation and upper-lower angles with intelligent filtering and behavior state highlighting.
+    Classifies body bends as upstream or downstream based on orientation.
     
-    Args:
-        trx_data (dict): Tracking data dictionary
-        larva_id (str, optional): ID of specific larva to analyze, if None, selects a random larva
-        smooth_window (int, optional): Window size for smoothing angles, defaults to 5
-        highlight_peaks (bool, optional): Whether to highlight peaks in the upper-lower angle during cast events
-        peak_prominence (float, optional): Minimum prominence for peak detection, if None uses auto-detection
-        peak_distance (int, optional): Minimum distance between peaks in frames, defaults to 20
+    Parameters:
+    -----------
+    trx_data : dict
+        The tracking data dictionary
+    larva_id : str or int, optional
+        ID of specific larva to analyze, if None, selects a random larva
+    smooth_window : int
+        Window size for smoothing (default=5)
+    jump_threshold : float
+        Threshold for detecting orientation jumps in degrees/frame (default=15)
+    """
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import find_peaks
+    from matplotlib.patches import Patch
+    
+    # Define behavior color scheme
+    behavior_colors = {
+        1: [0.0, 0.0, 0.0],  # Run/Crawl
+        2: [1.0, 0.0, 0.0],  # Cast/Bend
+        3: [0.0, 1.0, 0.0],  # Stop
+        4: [0.0, 0.0, 1.0],  # Hunch
+        5: [1.0, 0.5, 0.0],  # Backup
+        6: [0.5, 0.0, 0.5],  # Roll
+        7: [0.7, 0.7, 0.7]   # Small Actions
+    }
+    
+    # Behavior labels for legend
+    behavior_labels = {
+        1: 'Run/Crawl',
+        2: 'Cast/Bend',
+        3: 'Stop',
+        4: 'Hunch',
+        5: 'Backup',
+        6: 'Roll',
+        7: 'Small Actions'
+    }
+    
+    # Select larva if not specified
+    if larva_id is None:
+        larva_ids = list(trx_data.keys())
+        larva_id = np.random.choice(larva_ids)
+    
+    # Extract larva data
+    larva_data = trx_data[larva_id]
+    if 'data' in larva_data:
+        larva_data = larva_data['data']
+    
+    # Extract required data fields
+    time = np.array(larva_data['t']).flatten()
+    states = np.array(larva_data['global_state_large_state']).flatten()
+    
+    # Get orientation angles (calculate or extract)
+    if 'orientation_angle' in larva_data:
+        orientation_angles = np.array(larva_data['orientation_angle']).flatten()
+    else:
+        # Calculate orientation from tail to center (negative x-axis is 0 degrees)
+        x_center = np.array(larva_data['x_center']).flatten()
+        y_center = np.array(larva_data['y_center']).flatten()
+        x_tail = np.array(larva_data['x_spine'])[-1].flatten() if np.array(larva_data['x_spine']).ndim > 1 else np.array(larva_data['x_spine']).flatten()
+        y_tail = np.array(larva_data['y_spine'])[-1].flatten() if np.array(larva_data['y_spine']).ndim > 1 else np.array(larva_data['y_spine']).flatten()
+        
+        dx = x_center - x_tail
+        dy = y_center - y_tail
+        orientation_angles = np.degrees(np.arctan2(dy, -dx))  # -dx because 0° is negative x-axis
+    
+    # Get upper-lower bend angle
+    angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
+    angle_upper_lower_deg = np.degrees(angle_upper_lower)
+    
+    # Ensure all arrays have the same length
+    min_length = min(len(time), len(orientation_angles), len(angle_upper_lower_deg), len(states))
+    time = time[:min_length]
+    orientation_angles = orientation_angles[:min_length]
+    angle_upper_lower_deg = angle_upper_lower_deg[:min_length]
+    states = states[:min_length]
+    
+    # ==== FILTERING AND PROCESSING ====
+    
+    # 1. Orientation angle jump detection and correction
+    orientation_raw = orientation_angles.copy()
+    
+    # Calculate derivative to detect jumps
+    orientation_diff = np.abs(np.diff(orientation_angles))
+    # Add zero at the beginning to match length
+    orientation_diff = np.insert(orientation_diff, 0, 0)
+    
+    # Find jumps bigger than threshold
+    jumps = orientation_diff > jump_threshold
+    
+    # Create masked array for plotting
+    orientation_masked = np.ma.array(orientation_angles, mask=jumps)
+    
+    # Apply Gaussian smoothing to the filtered data
+    # First interpolate masked values for smoothing
+    orientation_interp = orientation_masked.filled(np.nan)
+    mask = np.isnan(orientation_interp)
+    
+    # Only interpolate if we have valid data
+    if np.sum(~mask) > 1:
+        indices = np.arange(len(orientation_interp))
+        valid_indices = indices[~mask]
+        valid_values = orientation_interp[~mask]
+        orientation_interp[mask] = np.interp(indices[mask], valid_indices, valid_values)
+    
+    # Apply smoothing
+    orientation_smooth = gaussian_filter1d(orientation_interp, smooth_window/3.0)
+    
+    # 2. Intelligent peak detection for bend angle
+    # Calculate slope changes
+    bend_angle_diff = np.diff(angle_upper_lower_deg)
+    # Add zero at the beginning to match length
+    bend_angle_diff = np.insert(bend_angle_diff, 0, 0)
+    
+    # Smooth the bend angle
+    bend_angle_smooth = gaussian_filter1d(angle_upper_lower_deg, smooth_window/3.0)
+    
+    # Find peaks with intelligent filtering:
+    # - Ignore peaks that start from flat regions (slope near zero)
+    # - Require minimum height and prominence
+    pos_peaks, _ = find_peaks(
+        bend_angle_smooth, 
+        height=5,        
+        prominence=3,        
+        distance=5
+    )
+    
+    neg_peaks, _ = find_peaks(
+        -bend_angle_smooth, 
+        height=5,        
+        prominence=3,        
+        distance=5
+    )
+    
+    # Combine positive and negative peaks
+    all_peaks = np.union1d(pos_peaks, neg_peaks)
+    
+    # Filter out peaks that start from flat regions
+    slope_threshold = 0.5  # Define what's considered "flat"
+    filtered_peaks = []
+    for peak in all_peaks:
+        if peak > 0 and abs(bend_angle_diff[peak-1]) > slope_threshold:
+            filtered_peaks.append(peak)
+    
+    # Classify peaks as upstream or downstream based on orientation
+    upstream_peaks = []
+    downstream_peaks = []
+    
+    for peak in filtered_peaks:
+        # Get orientation at time of peak (after smoothing)
+        orientation = orientation_smooth[peak]
+        bend_angle = bend_angle_smooth[peak]
+        
+        # Normalize orientation to -180 to 180 range
+        while orientation > 180:
+            orientation -= 360
+        while orientation <= -180:
+            orientation += 360
+            
+        # Classify based on orientation and bend direction
+        if (orientation > 0 and orientation < 180):  # Right side (positive orientation)
+            if bend_angle < 0:  # Negative bend is upstream
+                upstream_peaks.append(peak)
+            else:  # Positive bend is downstream
+                downstream_peaks.append(peak)
+        else:  # Left side (negative orientation)
+            if bend_angle > 0:  # Positive bend is upstream
+                upstream_peaks.append(peak)
+            else:  # Negative bend is downstream
+                downstream_peaks.append(peak)
+    
+    # ==== PLOTTING ====
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    
+    # Plot orientation angle
+    ax1.plot(time, orientation_raw, 'gray', alpha=0.3, label='Raw')
+    ax1.plot(time, orientation_smooth, 'b-', linewidth=1.5, label='Smoothed')
+    ax1.scatter(time[jumps], orientation_raw[jumps], color='r', s=20, alpha=0.5, label='Detected jumps')
+    ax1.set_ylabel('Orientation angle (°)')
+    ax1.set_title('Larva Orientation Angle (with jump detection)')
+    ax1.legend(loc='upper right')
+    
+    # Add reference lines for orientation
+    ax1.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+    ax1.axhline(y=180, color='gray', linestyle='--', alpha=0.3)
+    ax1.axhline(y=-180, color='gray', linestyle='--', alpha=0.3)
+    ax1.axhline(y=90, color='gray', linestyle=':', alpha=0.3)
+    ax1.axhline(y=-90, color='gray', linestyle=':', alpha=0.3)
+    
+    # Plot bend angle (upper-lower)
+    ax2.plot(time, angle_upper_lower_deg, 'gray', alpha=0.3, label='Raw')
+    ax2.plot(time, bend_angle_smooth, 'r-', linewidth=1.5, label='Smoothed')
+    
+    # Plot classified peaks
+    ax2.scatter(time[upstream_peaks], bend_angle_smooth[upstream_peaks], 
+               color='blue', s=80, marker='^', label='Upstream Peaks')
+    ax2.scatter(time[downstream_peaks], bend_angle_smooth[downstream_peaks], 
+               color='green', s=80, marker='v', label='Downstream Peaks')
+    
+    ax2.set_ylabel('Upper-lower angle (°)')
+    ax2.set_xlabel('Time (seconds)')
+    ax2.set_title('Body Bend Angle (with upstream/downstream detection)')
+    ax2.legend(loc='upper right')
+    
+    # Add behavioral state highlighting to both plots
+    for i in range(1, 8):
+        if i in behavior_colors:
+            mask = states == i
+            if np.any(mask):
+                ax1.fill_between(time, ax1.get_ylim()[0], ax1.get_ylim()[1], 
+                                where=mask, color=behavior_colors[i], alpha=0.2)
+                ax2.fill_between(time, ax2.get_ylim()[0], ax2.get_ylim()[1], 
+                                where=mask, color=behavior_colors[i], alpha=0.2)
+    
+    # Add explanatory annotations
+    ax1.text(time[0], 150, "0° = neg. x-axis\n±180° = pos. x-axis\n+90° = right\n-90° = left", 
+             fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add upstream/downstream explanatory text
+    ax2.text(time[0], ax2.get_ylim()[1]*0.8, 
+             "Right side (+90°): -ve bend = upstream, +ve bend = downstream\n" +
+             "Left side (-90°): +ve bend = upstream, -ve bend = downstream", 
+             fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add behavior legend
+    legend_elements = [
+        Patch(facecolor=behavior_colors[i], alpha=0.3, 
+              edgecolor='none', label=behavior_labels[i])
+        for i in range(1, 8) if i in behavior_colors
+    ]
+    fig.legend(handles=legend_elements, loc='lower center', 
+              title='Behaviors', ncol=4, fontsize=10, bbox_to_anchor=(0.5, 0))
+    
+    # Format plot
+    plt.tight_layout()
+    plt.suptitle(f'Filtered Angle Analysis for Larva {larva_id}', fontsize=14, y=1.02)
+    plt.subplots_adjust(bottom=0.15)  # Make room for the behavior legend
+    
+    plt.show()
+    
+    # Return results for further analysis
+    return {
+        'larva_id': larva_id,
+        'time': time,
+        'orientation_raw': orientation_raw,
+        'orientation_smooth': orientation_smooth,
+        'orientation_jumps': np.where(jumps)[0],
+        'bend_angle_raw': angle_upper_lower_deg,
+        'bend_angle_smooth': bend_angle_smooth,
+        'all_peaks': filtered_peaks,
+        'upstream_peaks': upstream_peaks,
+        'downstream_peaks': downstream_peaks,
+        'states': states
+    }
+
+def plot_filtered_angles_enhanced(trx_data, larva_id=None, smooth_window=5, jump_threshold=15,
+                                 sweep_start_threshold=20.0, sweep_end_threshold=10.0,
+                                 velocity_run_threshold=0.5):
+    """
+    Plot orientation and upper-lower angles with intelligent filtering and head sweep detection.
+    
+    Parameters:
+    -----------
+    trx_data : dict
+        The tracking data dictionary
+    larva_id : str or int, optional
+        ID of specific larva to analyze, if None, selects a random larva
+    smooth_window : int
+        Window size for smoothing (default=5)
+    jump_threshold : float
+        Threshold for detecting orientation jumps in degrees/frame (default=15)
+    sweep_start_threshold : float
+        Threshold angle in degrees to identify the start of a head sweep (default=20.0)
+    sweep_end_threshold : float
+        Threshold angle in degrees to identify the end of a head sweep (default=10.0)
+    velocity_run_threshold : float
+        Threshold for emotion velocity norm to identify runs (default=0.5)
     """
     import numpy as np
     import matplotlib.pyplot as plt
-    import random
-    from matplotlib.patches import Patch
     from scipy.ndimage import gaussian_filter1d
     from scipy.signal import find_peaks
+    import random
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    
+    # Define custom behavior color scheme
+    custom_behavior_colors = {
+        'run': [0.0, 0.5, 0.0],      # Green for runs
+        'turn': [0.7, 0.7, 0.0],      # Yellow for turns
+        'accepted_sweep': [0.0, 0.8, 0.3],  # Bright green for accepted head sweeps
+        'rejected_sweep': [0.8, 0.0, 0.0]   # Red for rejected head sweeps
+    }
+    
+    # Select larva if not specified
+    if larva_id is None:
+        larva_id = random.choice(list(trx_data.keys()))
+        print(f"Selected random larva: {larva_id}")
+    
+    # Extract larva data
+    larva_data = trx_data[larva_id]
+    if 'data' in larva_data:
+        larva_data = larva_data['data']
+    
+    # Extract required data fields
+    time = np.array(larva_data['t']).flatten()
+    states = np.array(larva_data['global_state_large_state']).flatten()
+    
+    # Extract coordinates for orientation calculation
+    x_center = np.array(larva_data['x_center']).flatten()
+    y_center = np.array(larva_data['y_center']).flatten()
+    
+    # Extract emotion velocity norm for run detection
+    if 'motion_velocity_norm_smooth_5' in larva_data:
+        velocity = np.array(larva_data['tail_velocity_norm_smooth_5']).flatten()
+    else:
+        # If emotion velocity isn't available, calculate velocity from center positions
+        print("Warning: motion_velocity_norm_smooth_5 not found, calculating from positions")
+        velocity = np.zeros_like(time)
+        for i in range(1, len(time)):
+            # Distance moved by center
+            dx = x_center[i] - x_center[i-1]
+            dy = y_center[i] - y_center[i-1]
+            # Velocity magnitude
+            dt = time[i] - time[i-1]
+            if dt > 0:
+                velocity[i] = np.sqrt(dx*dx + dy*dy) / dt
+            else:
+                velocity[i] = 0
+        
+        # Apply smoothing
+        velocity = gaussian_filter1d(velocity, 5/3.0)
+    
+    # Handle different spine data shapes
+    x_spine = np.array(larva_data['x_spine'])
+    y_spine = np.array(larva_data['y_spine'])
+    
+    if x_spine.ndim > 1:  # 2D array
+        x_tail = x_spine[-1].flatten()
+        y_tail = y_spine[-1].flatten()
+        x_neck = x_spine[0].flatten()  # First point is neck
+        y_neck = y_spine[0].flatten()
+    else:  # 1D array
+        x_tail = x_spine
+        y_tail = y_spine
+        x_neck = x_spine  # Can't differentiate neck in 1D case
+        y_neck = y_spine
+    
+    # Calculate orientation angles using tail-to-neck vector
+    orientation_angles = []
+    for i in range(len(x_neck)):
+        vector = np.array([x_neck[i] - x_tail[i], y_neck[i] - y_tail[i]])
+        if np.linalg.norm(vector) == 0:
+            orientation_angles.append(np.nan)
+        else:
+            angle_deg = np.degrees(np.arctan2(vector[1], -vector[0]))
+            orientation_angles.append(angle_deg)
+    
+    orientation_angles = np.array(orientation_angles)
+    
+    # Get upper-lower bend angle
+    angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
+    angle_upper_lower_deg = np.degrees(angle_upper_lower)
+    
+    # Ensure all arrays have the same length
+    min_length = min(len(time), len(orientation_angles), len(angle_upper_lower_deg), len(states), len(velocity))
+    time = time[:min_length]
+    orientation_angles = orientation_angles[:min_length]
+    angle_upper_lower_deg = angle_upper_lower_deg[:min_length]
+    states = states[:min_length]
+    velocity = velocity[:min_length]
+    
+    # ==== FILTERING AND PROCESSING ====
+    
+    # 1. Orientation angle jump detection and correction
+    orientation_raw = orientation_angles.copy()
+    
+    # Calculate derivative to detect jumps
+    orientation_diff = np.abs(np.diff(orientation_angles))
+    # Add zero at the beginning to match length
+    orientation_diff = np.insert(orientation_diff, 0, 0)
+    
+    # Find jumps bigger than threshold
+    jumps = orientation_diff > jump_threshold
+    
+    # Create masked array for plotting
+    orientation_masked = np.ma.array(orientation_angles, mask=jumps)
+    
+    # Apply Gaussian smoothing to the filtered data
+    # First interpolate masked values for smoothing
+    orientation_interp = orientation_masked.filled(np.nan)
+    mask = np.isnan(orientation_interp)
+    
+    # Only interpolate if we have valid data
+    if np.sum(~mask) > 1:
+        orientation_interp[mask] = np.interp(
+            np.flatnonzero(mask), 
+            np.flatnonzero(~mask), 
+            orientation_interp[~mask]
+        )
+    
+    # Apply smoothing
+    orientation_smooth = gaussian_filter1d(orientation_interp, smooth_window/3.0)
+    
+    # Apply smoothing to bend angle
+    bend_angle_smooth = gaussian_filter1d(angle_upper_lower_deg, smooth_window/3.0)
+    
+    # 2. Determine run vs turn segments based on emotion velocity
+    # A run is when emotion velocity exceeds the threshold
+    is_run = velocity > velocity_run_threshold
+    
+    # 3. Find run and turn segments
+    run_segments = []
+    turn_segments = []
+    
+    # Define minimum run and turn length (to avoid brief fluctuations)
+    min_run_length = 3  # frames
+    min_turn_length = 3  # frames
+    
+    # Process runs with minimum duration
+    in_run = False
+    run_start = 0
+    for i in range(min_length):
+        if is_run[i] and not in_run:
+            # Potential start of run
+            run_start = i
+            in_run = True
+        elif not is_run[i] and in_run:
+            # End of run
+            if i - run_start >= min_run_length:
+                run_segments.append((run_start, i))
+            in_run = False
+    
+    # Handle case when still in run at end of data
+    if in_run and min_length - run_start >= min_run_length:
+        run_segments.append((run_start, min_length-1))
+    
+    # Calculate turn segments as gaps between runs
+    if len(run_segments) > 0:
+        # If first run doesn't start at beginning, add initial turn
+        if run_segments[0][0] > 0:
+            turn_segments.append((0, run_segments[0][0]))
+            
+        # Add turns between runs
+        for i in range(len(run_segments)-1):
+            # Only add turn if it's long enough
+            turn_start = run_segments[i][1]
+            turn_end = run_segments[i+1][0]
+            if turn_end - turn_start >= min_turn_length:
+                turn_segments.append((turn_start, turn_end))
+            
+        # If last run doesn't end at end, add final turn
+        if run_segments[-1][1] < min_length-1:
+            turn_segments.append((run_segments[-1][1], min_length-1))
+    else:
+        # If no runs at all, entire sequence is a turn
+        turn_segments.append((0, min_length-1))
+    
+    # 4. Find head sweeps during turns using the customizable thresholds
+    head_sweep_segments = []
+    
+    # Check each turn segment for head sweeps
+    for turn_start, turn_end in turn_segments:
+        in_head_sweep = False
+        head_sweep_start = turn_start
+        head_sweep_sign = 0  # Direction of bend: +1 for positive, -1 for negative
+        
+        for i in range(turn_start, turn_end+1):
+            bend_angle = bend_angle_smooth[i]
+            abs_bend = abs(bend_angle)
+            
+            if not in_head_sweep and abs_bend > sweep_start_threshold:
+                # Start a new head sweep
+                in_head_sweep = True
+                head_sweep_start = i
+                head_sweep_sign = 1 if bend_angle > 0 else -1
+            
+            elif in_head_sweep:
+                # Check if head sweep should end
+                if (abs_bend < sweep_end_threshold or 
+                    (bend_angle * head_sweep_sign < 0) or  # Sign changed
+                    (i == turn_end)):  # Turn ended
+                    
+                    # Head sweep ended, save segment
+                    head_sweep_segments.append((head_sweep_start, i, turn_start, turn_end))
+                    in_head_sweep = False
+    
+    # 5. Classify head sweeps as accepted or rejected
+    accepted_sweeps = []
+    rejected_sweeps = []
+    
+    for sweep_start, sweep_end, turn_start, turn_end in head_sweep_segments:
+        # A head sweep is accepted if it begins a new run
+        # This means the sweep is the last one in the turn
+        is_last_in_turn = True
+        
+        # Look if there are other sweeps in the same turn that start after this one
+        for other_start, other_end, other_turn_start, other_turn_end in head_sweep_segments:
+            if (other_turn_start == turn_start and other_start > sweep_start):
+                is_last_in_turn = False
+                break
+        
+        # Check if the turn is immediately followed by a run
+        followed_by_run = False
+        for run_start, run_end in run_segments:
+            if run_start == turn_end:
+                followed_by_run = True
+                break
+        
+        # Accepted if last sweep in turn and turn is followed by a run
+        if is_last_in_turn and followed_by_run:
+            accepted_sweeps.append((sweep_start, sweep_end))
+        else:
+            rejected_sweeps.append((sweep_start, sweep_end))
+    
+    # ==== PLOTTING ====
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    
+    # Plot orientation angle
+    ax1.plot(time, orientation_raw, 'gray', alpha=0.3, label='Raw')
+    ax1.plot(time, orientation_smooth, 'b-', linewidth=1.5, label='Smoothed')
+    ax1.scatter(time[jumps], orientation_raw[jumps], color='r', s=20, alpha=0.5, label='Detected jumps')
+    ax1.set_ylabel('Orientation angle (°)')
+    ax1.set_title('Larva Orientation Angle (Tail-to-Neck)')
+    ax1.legend(loc='upper right')
+    
+    # Add reference lines for orientation
+    ax1.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+    ax1.axhline(y=180, color='gray', linestyle='--', alpha=0.3)
+    ax1.axhline(y=-180, color='gray', linestyle='--', alpha=0.3)
+    ax1.axhline(y=90, color='gray', linestyle=':', alpha=0.3)
+    ax1.axhline(y=-90, color='gray', linestyle=':', alpha=0.3)
+    
+    # Plot bend angle with original behavior and emotion velocity
+    ax2.plot(time, angle_upper_lower_deg, 'gray', alpha=0.3, label='Raw bend')
+    ax2.plot(time, bend_angle_smooth, 'r-', linewidth=1.5, label='Smoothed bend')
+    
+    # Plot emotion velocity on second y-axis
+    ax2b = ax2.twinx()
+    ax2b.plot(time, velocity, 'b-', linewidth=1.0, alpha=0.6, label='Emotion velocity')
+    ax2b.axhline(y=velocity_run_threshold, color='b', linestyle='--', alpha=0.5, 
+                label=f'Run threshold: {velocity_run_threshold}')
+    ax2b.set_ylabel('Emotion velocity', color='b')
+    ax2b.tick_params(axis='y', labelcolor='b')
+    
+    # Add legend for both lines
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2b.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
+    ax2.set_ylabel('Body bend angle (°)', color='r')
+    ax2.tick_params(axis='y', labelcolor='r')
+    ax2.set_title('Body Bend Angle and Emotion Velocity')
+    
+    # Plot bend angle with custom behavior classification for third plot
+    ax3.plot(time, bend_angle_smooth, 'k-', linewidth=1.0)
+    ax3.set_ylabel('Body bend angle (°)')
+    ax3.set_xlabel('Time (seconds)')
+    ax3.set_title('Body Bend Angle with Custom Run/Turn Classification')
+    
+    # Add threshold reference lines to third plot
+    ax3.axhline(y=sweep_start_threshold, color='blue', linestyle='-', alpha=0.5)
+    ax3.axhline(y=-sweep_start_threshold, color='blue', linestyle='-', alpha=0.5)
+    ax3.axhline(y=sweep_end_threshold, color='cyan', linestyle='--', alpha=0.5)
+    ax3.axhline(y=-sweep_end_threshold, color='cyan', linestyle='--', alpha=0.5)
+    
+    # Highlight run segments
+    for run_start, run_end in run_segments:
+        ax3.axvspan(time[run_start], time[run_end], 
+                   color=custom_behavior_colors['run'], alpha=0.3)
+    
+    # Highlight turn segments
+    for turn_start, turn_end in turn_segments:
+        ax3.axvspan(time[turn_start], time[turn_end], 
+                   color=custom_behavior_colors['turn'], alpha=0.3)
+    
+    # Highlight accepted head sweeps with higher alpha to make them stand out
+    for sweep_start, sweep_end in accepted_sweeps:
+        ax3.axvspan(time[sweep_start], time[sweep_end],
+                   color=custom_behavior_colors['accepted_sweep'], alpha=0.7)
+    
+    # Highlight rejected head sweeps with higher alpha to make them stand out
+    for sweep_start, sweep_end in rejected_sweeps:
+        ax3.axvspan(time[sweep_start], time[sweep_end],
+                   color=custom_behavior_colors['rejected_sweep'], alpha=0.7)
+    
+    # Add explanatory annotation
+    ax1.text(time[0], 150, "0° = neg. x-axis\n±180° = pos. x-axis\n+90° = right\n-90° = left", 
+             fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add custom behavior legend
+    custom_legend_elements = [
+        Patch(facecolor=custom_behavior_colors['run'], alpha=0.3, 
+              edgecolor='none', label='Run (emotion velocity > threshold)'),
+        Patch(facecolor=custom_behavior_colors['turn'], alpha=0.3, 
+              edgecolor='none', label='Turn (between runs)'),
+        Patch(facecolor=custom_behavior_colors['accepted_sweep'], alpha=0.7, 
+              edgecolor='none', label='Accepted head sweep'),
+        Patch(facecolor=custom_behavior_colors['rejected_sweep'], alpha=0.7, 
+              edgecolor='none', label='Rejected head sweep'),
+        Line2D([0], [0], color='blue', linestyle='-', alpha=0.5, 
+              label=f'Sweep start threshold (±{sweep_start_threshold}°)'),
+        Line2D([0], [0], color='cyan', linestyle='--', alpha=0.5, 
+              label=f'Sweep end threshold (±{sweep_end_threshold}°)'),
+        Line2D([0], [0], color='b', linestyle='--', alpha=0.5, 
+              label=f'Run velocity threshold ({velocity_run_threshold})')
+    ]
+    
+    # Add threshold legend
+    fig.legend(handles=custom_legend_elements, loc='lower center', 
+              ncol=3, fontsize=9, bbox_to_anchor=(0.5, 0))
+    
+    # Format plot
+    plt.tight_layout()
+    plt.suptitle(f'Custom Run/Turn Analysis for Larva {larva_id}', fontsize=14, y=1.02)
+    plt.subplots_adjust(bottom=0.15)  # Make room for the legend
+    
+    plt.show()
+    
+    # Return results for further analysis
+    return {
+        'larva_id': larva_id,
+        'time': time,
+        'orientation_smooth': orientation_smooth,
+        'bend_angle_smooth': bend_angle_smooth,
+        'emotion_velocity': velocity,
+        'run_segments': run_segments,
+        'turn_segments': turn_segments,
+        'accepted_sweeps': accepted_sweeps,
+        'rejected_sweeps': rejected_sweeps
+    }
+
+def plot_combined_behavioral_analysis(trx_data, larva_id=None, smooth_window=5, jump_threshold=15,
+                                  sweep_start_threshold=20.0, sweep_end_threshold=10.0,
+                                  velocity_run_threshold=0.5):
+    """
+    Plot orientation and upper-lower angles with both behavioral state highlighting 
+    and accepted/rejected head sweep detection.
+    
+    Parameters:
+    -----------
+    trx_data : dict
+        The tracking data dictionary
+    larva_id : str or int, optional
+        ID of specific larva to analyze, if None, selects a random larva
+    smooth_window : int
+        Window size for smoothing (default=5)
+    jump_threshold : float
+        Threshold for detecting orientation jumps in degrees/frame (default=15)
+    sweep_start_threshold : float
+        Threshold angle in degrees to identify the start of a head sweep (default=20.0)
+    sweep_end_threshold : float
+        Threshold angle in degrees to identify the end of a head sweep (default=10.0)
+    velocity_run_threshold : float
+        Threshold for motion velocity norm to identify runs (default=0.5)
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import find_peaks
+    import random
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     
     # Define behavior color scheme
     behavior_colors = {
@@ -3796,359 +4440,307 @@ def plot_larva_angle_dynamics(trx_data, larva_id=None, smooth_window=5, highligh
         7: 'Small Actions'
     }
     
-    # Helper function to calculate signed angle between vectors
-    def calculate_signed_angle(v1, v2):
-        """
-        Calculate signed angle between two vectors in degrees.
-        Positive angle means v2 is to the right of v1, negative means to the left.
-        """
-        # Cross product for direction (sign)
-        cross_products = np.cross(v1, v2)
-        
-        # Dot product for angle
-        dot_products = np.sum(v1 * v2, axis=1)
-        norms_v1 = np.linalg.norm(v1, axis=1)
-        norms_v2 = np.linalg.norm(v2, axis=1)
-        
-        # Avoid division by zero
-        valid_mask = (norms_v1 > 0) & (norms_v2 > 0)
-        
-        # Calculate unsigned angle
-        cos_angles = np.zeros(len(v1))
-        cos_angles[valid_mask] = dot_products[valid_mask] / (norms_v1[valid_mask] * norms_v2[valid_mask])
-        
-        # Clip to handle floating point errors
-        cos_angles = np.clip(cos_angles, -1.0, 1.0)
-        angles = np.degrees(np.arccos(cos_angles))
-        
-        # Apply sign based on cross product
-        # If cross product is negative, angle is negative (bend to the left)
-        # If cross product is positive, angle is positive (bend to the right)
-        signed_angles = angles * np.sign(cross_products)
-        
-        return signed_angles
+    # Define custom head sweep color scheme
+    sweep_colors = {
+        'run': [0.0, 0.5, 0.0],           # Green for runs
+        'turn': [0.7, 0.7, 0.0],          # Yellow for turns
+        'accepted_sweep': [0.0, 0.8, 0.3], # Bright green for accepted head sweeps
+        'rejected_sweep': [0.8, 0.0, 0.0]  # Red for rejected head sweeps
+    }
     
-    # Helper function to calculate orientation angle (relative to negative x-axis)
-    def calculate_orientation_angle(v):
-        """
-        Calculate angle between vector and negative x-axis in degrees.
-        0° = aligned with negative x-axis, 180° = aligned with positive x-axis
-        +90° = pointing right (y-axis), -90° = pointing left (negative y-axis)
-        """
-        # Negative x-axis unit vector
-        neg_x_axis = np.array([-1.0, 0.0])
-        
-        # Calculate angles for each vector
-        orientation_angles = np.zeros(len(v))
-        
-        for i in range(len(v)):
-            if np.linalg.norm(v[i]) == 0:
-                # Handle zero vectors
-                orientation_angles[i] = np.nan
-                continue
-                
-            # Normalize the vector
-            normalized_v = v[i] / np.linalg.norm(v[i])
-            
-            # Calculate angle with negative x-axis using dot product
-            dot_product = np.dot(normalized_v, neg_x_axis)
-            angle_rad = np.arccos(np.clip(dot_product, -1.0, 1.0))
-            angle_deg = np.degrees(angle_rad)
-            
-            # Determine sign based on y-component
-            # If y > 0, vector points up/right of the negative x-axis: positive angle
-            # If y < 0, vector points down/left of the negative x-axis: negative angle
-            if normalized_v[1] < 0:
-                angle_deg = -angle_deg
-                
-            orientation_angles[i] = angle_deg
-            
-        return orientation_angles
-    
-    # Helper function to smooth data
-    def smooth_data(data, window_size):
-        """Apply Gaussian smoothing to data"""
-        sigma = window_size / 3.0  # Approximately equivalent to moving average
-        return gaussian_filter1d(data, sigma)
-    
-    # Helper function to find global peaks during specific behavior states
-    def find_global_peaks_during_behavior(data, states, behavior_id, time, min_prominence=None, min_distance=20):
-        """
-        Find significant peaks (both positive and negative) during specified behavior state.
-        For negative peaks, we invert the data, find peaks, then invert the results.
-        """
-        # Create a mask for the specified behavior
-        behavior_mask = states == behavior_id
-        
-        # If no data points with this behavior, return empty arrays
-        if not np.any(behavior_mask):
-            return {
-                "positive": {"times": np.array([]), "values": np.array([])},
-                "negative": {"times": np.array([]), "values": np.array([])}
-            }
-            
-        # Create a copy of data for masking
-        masked_data = data.copy()
-        
-        # If min_prominence is not specified, auto-calculate based on data range during behavior
-        if min_prominence is None:
-            behavior_data = data[behavior_mask]
-            if len(behavior_data) > 0:
-                data_range = np.max(behavior_data) - np.min(behavior_data)
-                min_prominence = data_range * 0.15  # 15% of range as default
-            else:
-                min_prominence = np.std(data) * 0.8  # Fallback
-        
-        # For negative peaks, we'll invert the data
-        inverted_data = -1 * masked_data
-        
-        # Find positive peaks (only during behavior state)
-        # First, mask out non-behavior segments with very low values
-        pos_masked_data = masked_data.copy()
-        pos_masked_data[~behavior_mask] = np.min(masked_data) - 100
-        pos_peak_indices, pos_properties = find_peaks(
-            pos_masked_data, 
-            prominence=min_prominence, 
-            distance=min_distance
-        )
-        
-        # Find negative peaks (only during behavior state)
-        # First, mask out non-behavior segments with very low values
-        neg_masked_data = inverted_data.copy()
-        neg_masked_data[~behavior_mask] = np.min(inverted_data) - 100
-        neg_peak_indices, neg_properties = find_peaks(
-            neg_masked_data, 
-            prominence=min_prominence, 
-            distance=min_distance
-        )
-        
-        # Prepare results
-        results = {
-            "positive": {
-                "times": time[pos_peak_indices],
-                "values": data[pos_peak_indices],
-                "prominence": pos_properties.get("prominences", []),
-                "indices": pos_peak_indices
-            },
-            "negative": {
-                "times": time[neg_peak_indices],
-                "values": data[neg_peak_indices],
-                "prominence": neg_properties.get("prominences", []),
-                "indices": neg_peak_indices
-            }
-        }
-        
-        return results
-    
-    # Determine which data structure we're working with
-    if 'data' in trx_data:
-        data_to_process = trx_data['data']
-    else:
-        data_to_process = trx_data
-    
-    # Select a larva if not specified
+    # Select larva if not specified
     if larva_id is None:
-        valid_larvae = []
-        for lid, larva_data in data_to_process.items():
-            try:
-                # Extract larva data if nested
-                if 'data' in larva_data:
-                    larva_data = larva_data['data']
-                
-                # Check if larva has required data
-                if ('x_spine' in larva_data and 
-                    'y_spine' in larva_data and
-                    'x_center' in larva_data and
-                    'y_center' in larva_data and
-                    'x_neck' in larva_data and
-                    'y_neck' in larva_data and
-                    'x_neck_down' in larva_data and
-                    'y_neck_down' in larva_data and
-                    'x_neck_top' in larva_data and
-                    'y_neck_top' in larva_data and
-                    'angle_upper_lower_smooth_5' in larva_data and
-                    'global_state_large_state' in larva_data):
-                    valid_larvae.append(lid)
-            except:
-                continue
-        
-        if not valid_larvae:
-            raise ValueError("No larvae with valid data found")
-        
-        # Select exactly one random larva
-        larva_id = random.choice(valid_larvae)
+        larva_id = random.choice(list(trx_data.keys()))
         print(f"Selected random larva: {larva_id}")
     
-    # Get data for the selected larva
-    larva_data = data_to_process[larva_id]
+    # Extract larva data
+    larva_data = trx_data[larva_id]
     if 'data' in larva_data:
         larva_data = larva_data['data']
     
-    # Extract data arrays
-    try:
-        # Coordinates for angle calculations
-        x_spine = np.array(larva_data['x_spine'])
-        y_spine = np.array(larva_data['y_spine'])
-        x_center = np.array(larva_data['x_center']).flatten()
-        y_center = np.array(larva_data['y_center']).flatten()
-        x_neck = np.array(larva_data['x_neck']).flatten()
-        y_neck = np.array(larva_data['y_neck']).flatten()
-        x_neck_down = np.array(larva_data['x_neck_down']).flatten()
-        y_neck_down = np.array(larva_data['y_neck_down']).flatten()
-        x_neck_top = np.array(larva_data['x_neck_top']).flatten()
-        y_neck_top = np.array(larva_data['y_neck_top']).flatten()
-        
-        # Pre-calculated angles
-        angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
-        
-        # Time and behavioral states
-        time = np.array(larva_data['t']).flatten()
-        states = np.array(larva_data['global_state_large_state']).flatten()
-        
-        # Check for sufficient data
-        if len(time) < 10:  # Require at least 10 frames
-            raise ValueError(f"Insufficient data for larva {larva_id}")
-            
-    except KeyError as e:
-        raise KeyError(f"Missing required data field for larva {larva_id}: {str(e)}")
+    # Extract required data fields
+    time = np.array(larva_data['t']).flatten()
+    states = np.array(larva_data['global_state_large_state']).flatten()
     
-    # Handle different spine data shapes to get head and tail coordinates
-    if x_spine.ndim == 1:  # 1D array
-        x_tail = x_spine
-        y_tail = y_spine
-        x_head = x_spine
-        y_head = y_spine
-    else:  # 2D array with shape (spine_points, frames)
+    # Extract coordinates for orientation calculation
+    x_center = np.array(larva_data['x_center']).flatten()
+    y_center = np.array(larva_data['y_center']).flatten()
+    
+    # Extract motion velocity norm for run detection
+    if 'motion_velocity_norm_smooth_5' in larva_data:
+        velocity = np.array(larva_data['motion_velocity_norm_smooth_5']).flatten()
+    elif 'tail_velocity_norm_smooth_5' in larva_data:
+        velocity = np.array(larva_data['tail_velocity_norm_smooth_5']).flatten()
+    else:
+        # If motion velocity isn't available, calculate velocity from center positions
+        print("Warning: motion_velocity_norm_smooth_5 not found, calculating from positions")
+        velocity = np.zeros_like(time)
+        for i in range(1, len(time)):
+            # Distance moved by center
+            dx = x_center[i] - x_center[i-1]
+            dy = y_center[i] - y_center[i-1]
+            # Velocity magnitude
+            dt = time[i] - time[i-1]
+            if dt > 0:
+                velocity[i] = np.sqrt(dx*dx + dy*dy) / dt
+            else:
+                velocity[i] = 0
+        
+        # Apply smoothing
+        velocity = gaussian_filter1d(velocity, 5/3.0)
+    
+    # Handle different spine data shapes
+    x_spine = np.array(larva_data['x_spine'])
+    y_spine = np.array(larva_data['y_spine'])
+    
+    if x_spine.ndim > 1:  # 2D array
         x_tail = x_spine[-1].flatten()
         y_tail = y_spine[-1].flatten()
-        x_head = x_spine[0].flatten()
-        y_head = y_spine[0].flatten()
-    
-    # 1. Calculate vectors for neck angle (signed angle between tail-to-neck and neck-to-head)
-    tail_to_neck = np.column_stack([
-        x_neck - x_tail,
-        y_neck - y_tail
-    ])
-    
-    neck_to_head = np.column_stack([
-        x_head - x_neck,
-        y_head - y_neck
-    ])
-    
-    # Calculate signed neck angle
-    angle_neck = calculate_signed_angle(tail_to_neck, neck_to_head)
-    # Create smoothed version
-    angle_neck_smooth = smooth_data(angle_neck, smooth_window)
-    
-    # 2. Calculate vectors for center angle (signed angle between tail-to-center and center-to-head)
-    tail_to_center = np.column_stack([
-        x_center - x_tail,
-        y_center - y_tail
-    ])
-    
-    center_to_head = np.column_stack([
-        x_head - x_center,
-        y_head - y_center
-    ])
-    
-    # Calculate signed center angle
-    angle_center = calculate_signed_angle(tail_to_center, center_to_head)
-    # Create smoothed version
-    angle_center_smooth = smooth_data(angle_center, smooth_window)
-    
-    # 3. Calculate orientation angle (angle between tail-to-center vector and negative x-axis)
-    # First, we need vectors from tail to center
-    orientation_vectors = tail_to_center
+        x_neck = x_spine[0].flatten()  # First point is neck
+        y_neck = y_spine[0].flatten()
+    else:  # 1D array
+        x_tail = x_spine
+        y_tail = y_spine
+        x_neck = x_spine  # Can't differentiate neck in 1D case
+        y_neck = y_spine
     
     # Calculate orientation angles
-    orientation_angle = calculate_orientation_angle(orientation_vectors)
-    # Create smoothed version
-    orientation_angle_smooth = smooth_data(orientation_angle, smooth_window)
+    orientation_angles = []
+    for i in range(len(x_center)):
+        vector = np.array([x_center[i] - x_tail[i], y_center[i] - y_tail[i]])
+        if np.linalg.norm(vector) == 0:
+            orientation_angles.append(np.nan)
+        else:
+            angle_deg = np.degrees(np.arctan2(vector[1], -vector[0]))
+            orientation_angles.append(angle_deg)
     
-    # 4. Convert other angles to degrees
+    orientation_angles = np.array(orientation_angles)
+    
+    # Get upper-lower bend angle
+    angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
     angle_upper_lower_deg = np.degrees(angle_upper_lower)
     
     # Ensure all arrays have the same length
-    min_length = min(len(time), len(angle_neck), len(angle_center), 
-                    len(orientation_angle), len(angle_upper_lower_deg), len(states))
-    
+    min_length = min(len(time), len(orientation_angles), len(angle_upper_lower_deg), len(states), len(velocity))
     time = time[:min_length]
-    angle_neck = angle_neck[:min_length]
-    angle_neck_smooth = angle_neck_smooth[:min_length]
-    angle_center = angle_center[:min_length]
-    angle_center_smooth = angle_center_smooth[:min_length]
-    orientation_angle = orientation_angle[:min_length]
-    orientation_angle_smooth = orientation_angle_smooth[:min_length]
+    orientation_angles = orientation_angles[:min_length]
     angle_upper_lower_deg = angle_upper_lower_deg[:min_length]
     states = states[:min_length]
+    velocity = velocity[:min_length]
     
-    # Find global peaks in the upper-lower angle during cast/bend events (state 2)
-    if highlight_peaks:
-        # Find both positive and negative peaks only during cast/bend behavior (state 2)
-        peaks_results = find_global_peaks_during_behavior(
-            angle_upper_lower_deg, states, 2, time, 
-            min_prominence=peak_prominence, 
-            min_distance=peak_distance
+    # ==== FILTERING AND PROCESSING ====
+    
+    # 1. Orientation angle jump detection and correction
+    orientation_raw = orientation_angles.copy()
+    
+    # Calculate derivative to detect jumps
+    orientation_diff = np.abs(np.diff(orientation_angles))
+    # Add zero at the beginning to match length
+    orientation_diff = np.insert(orientation_diff, 0, 0)
+    
+    # Find jumps bigger than threshold
+    jumps = orientation_diff > jump_threshold
+    
+    # Create masked array for plotting
+    orientation_masked = np.ma.array(orientation_angles, mask=jumps)
+    
+    # Apply Gaussian smoothing to the filtered data
+    # First interpolate masked values for smoothing
+    orientation_interp = orientation_masked.filled(np.nan)
+    mask = np.isnan(orientation_interp)
+    
+    # Only interpolate if we have valid data
+    if np.sum(~mask) > 1:
+        orientation_interp[mask] = np.interp(
+            np.flatnonzero(mask), 
+            np.flatnonzero(~mask), 
+            orientation_interp[~mask]
         )
+    
+    # Apply smoothing
+    orientation_smooth = gaussian_filter1d(orientation_interp, smooth_window/3.0)
+    
+    # 2. Intelligent peak detection for bend angle
+    # Calculate slope changes
+    bend_angle_diff = np.diff(angle_upper_lower_deg)
+    # Add zero at the beginning to match length
+    bend_angle_diff = np.insert(bend_angle_diff, 0, 0)
+    
+    # Smooth the bend angle
+    bend_angle_smooth = gaussian_filter1d(angle_upper_lower_deg, smooth_window/3.0)
+    
+    # Find peaks with intelligent filtering
+    bend_peaks, _ = find_peaks(
+        np.abs(bend_angle_smooth), 
+        height=5,       # Minimum peak height
+        prominence=3,   # Minimum prominence
+        distance=5      # Minimum distance between peaks
+    )
+    
+    # Filter out peaks that start from flat regions
+    slope_threshold = 0.5  # Define what's considered "flat"
+    filtered_peaks = []
+    for peak in bend_peaks:
+        # Check at least 3 points before the peak for slope
+        if peak > 3:
+            # Calculate average slope before the peak
+            pre_peak_slopes = np.abs(bend_angle_diff[peak-3:peak])
+            avg_pre_slope = np.mean(pre_peak_slopes)
+            if avg_pre_slope > slope_threshold:
+                filtered_peaks.append(peak)
+    
+    # 3. Determine run vs turn segments based on motion velocity
+    # A run is when motion velocity exceeds the threshold
+    is_run = velocity > velocity_run_threshold
+    
+    # 4. Find run and turn segments
+    run_segments = []
+    turn_segments = []
+    
+    # Define minimum run and turn length (to avoid brief fluctuations)
+    min_run_length = 3  # frames
+    min_turn_length = 3  # frames
+    
+    # Process runs with minimum duration
+    in_run = False
+    run_start = 0
+    for i in range(min_length):
+        if is_run[i] and not in_run:
+            # Potential start of run
+            run_start = i
+            in_run = True
+        elif not is_run[i] and in_run:
+            # End of run
+            if i - run_start >= min_run_length:
+                run_segments.append((run_start, i))
+            in_run = False
+    
+    # Handle case when still in run at end of data
+    if in_run and min_length - run_start >= min_run_length:
+        run_segments.append((run_start, min_length-1))
+    
+    # Calculate turn segments as gaps between runs
+    if len(run_segments) > 0:
+        # If first run doesn't start at beginning, add initial turn
+        if run_segments[0][0] > 0:
+            turn_segments.append((0, run_segments[0][0]))
+            
+        # Add turns between runs
+        for i in range(len(run_segments)-1):
+            # Only add turn if it's long enough
+            turn_start = run_segments[i][1]
+            turn_end = run_segments[i+1][0]
+            if turn_end - turn_start >= min_turn_length:
+                turn_segments.append((turn_start, turn_end))
+            
+        # If last run doesn't end at end, add final turn
+        if run_segments[-1][1] < min_length-1:
+            turn_segments.append((run_segments[-1][1], min_length-1))
+    else:
+        # If no runs at all, entire sequence is a turn
+        turn_segments.append((0, min_length-1))
+    
+    # 5. Find head sweeps during turns using the customizable thresholds
+    head_sweep_segments = []
+    
+    # Check each turn segment for head sweeps
+    for turn_start, turn_end in turn_segments:
+        in_head_sweep = False
+        head_sweep_start = turn_start
+        head_sweep_sign = 0  # Direction of bend: +1 for positive, -1 for negative
         
-        pos_peak_times = peaks_results["positive"]["times"]
-        pos_peak_values = peaks_results["positive"]["values"]
-        neg_peak_times = peaks_results["negative"]["times"]
-        neg_peak_values = peaks_results["negative"]["values"]
+        for i in range(turn_start, turn_end+1):
+            bend_angle = bend_angle_smooth[i]
+            abs_bend = abs(bend_angle)
+            
+            if not in_head_sweep and abs_bend > sweep_start_threshold:
+                # Start a new head sweep
+                in_head_sweep = True
+                head_sweep_start = i
+                head_sweep_sign = 1 if bend_angle > 0 else -1
+            
+            elif in_head_sweep:
+                # Check if head sweep should end
+                if (abs_bend < sweep_end_threshold or 
+                    (bend_angle * head_sweep_sign < 0) or  # Sign changed
+                    (i == turn_end)):  # Turn ended
+                    
+                    # Head sweep ended, save segment
+                    head_sweep_segments.append((head_sweep_start, i, turn_start, turn_end))
+                    in_head_sweep = False
     
-    # Create figure with 4 stacked plots sharing x-axis
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    # 6. Classify head sweeps as accepted or rejected
+    accepted_sweeps = []
+    rejected_sweeps = []
     
-    # Plot 1: Neck angle with both raw and smoothed data
-    ax1.axhline(y=0, color='gray', linestyle='-', alpha=0.3)  # Reference line at y=0
-    ax1.plot(time, angle_neck, 'k-', linewidth=0.8, alpha=0.5, label='Raw')
-    ax1.plot(time, angle_neck_smooth, 'b-', linewidth=1.5, label=f'Smoothed (window={smooth_window})')
-    ax1.set_ylabel('Neck angle (°)\n(tail-neck-head)', fontsize=12)
-    ax1.set_title(f'Angle Dynamics for Larva {larva_id}', fontsize=14)
+    for sweep_start, sweep_end, turn_start, turn_end in head_sweep_segments:
+        # A head sweep is accepted if it begins a new run
+        # This means the sweep is the last one in the turn
+        is_last_in_turn = True
+        
+        # Look if there are other sweeps in the same turn that start after this one
+        for other_start, other_end, other_turn_start, other_turn_end in head_sweep_segments:
+            if (other_turn_start == turn_start and other_start > sweep_start):
+                is_last_in_turn = False
+                break
+        
+        # Check if the turn is immediately followed by a run
+        followed_by_run = False
+        for run_start, run_end in run_segments:
+            if run_start == turn_end:
+                followed_by_run = True
+                break
+        
+        # Accepted if last sweep in turn and turn is followed by a run
+        if is_last_in_turn and followed_by_run:
+            accepted_sweeps.append((sweep_start, sweep_end))
+        else:
+            rejected_sweeps.append((sweep_start, sweep_end))
+    
+    # ==== PLOTTING ====
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    
+    # Plot 1: Orientation angle with jumps
+    ax1.plot(time, orientation_raw, 'gray', alpha=0.3, label='Raw')
+    ax1.plot(time, orientation_smooth, 'b-', linewidth=1.5, label='Smoothed')
+    ax1.scatter(time[jumps], orientation_raw[jumps], color='r', s=20, alpha=0.5, label='Detected jumps')
+    ax1.set_ylabel('Orientation angle (°)')
+    ax1.set_title('Larva Orientation Angle (Tail-to-Center)')
     ax1.legend(loc='upper right')
     
-    # Plot 2: Center angle with both raw and smoothed data
-    ax2.axhline(y=0, color='gray', linestyle='-', alpha=0.3)  # Reference line at y=0
-    ax2.plot(time, angle_center, 'k-', linewidth=0.8, alpha=0.5, label='Raw')
-    ax2.plot(time, angle_center_smooth, 'r-', linewidth=1.5, label=f'Smoothed (window={smooth_window})')
-    ax2.set_ylabel('Center angle (°)\n(tail-center-head)', fontsize=12)
-    ax2.legend(loc='upper right')
+    # Add reference lines for orientation
+    ax1.axhline(y=0, color='gray', linestyle='-', alpha=0.3)  # Downstream
+    ax1.axhline(y=180, color='gray', linestyle='--', alpha=0.3)  # Upstream
+    ax1.axhline(y=-180, color='gray', linestyle='--', alpha=0.3)  # Upstream
+    ax1.axhline(y=90, color='gray', linestyle=':', alpha=0.3)  # Right
+    ax1.axhline(y=-90, color='gray', linestyle=':', alpha=0.3)  # Left
     
-    # Plot 3: Orientation angle
-    # Add reference lines for 0, 90, -90, and 180 degrees
-    ax3.axhline(y=0, color='gray', linestyle='-', alpha=0.3)     # 0 degrees (negative x-axis)
-    ax3.axhline(y=90, color='gray', linestyle='--', alpha=0.3)   # 90 degrees (up)
-    ax3.axhline(y=-90, color='gray', linestyle='--', alpha=0.3)  # -90 degrees (down)
-    ax3.axhline(y=180, color='gray', linestyle='-.', alpha=0.3)  # 180 degrees (positive x-axis)
-    ax3.axhline(y=-180, color='gray', linestyle='-.', alpha=0.3) # -180 degrees (also positive x-axis)
+    # Add explanatory annotation
+    ax1.text(time[0], 150, "0° = neg. x-axis\n±180° = pos. x-axis\n+90° = right\n-90° = left", 
+             fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
     
-    ax3.plot(time, orientation_angle, 'k-', linewidth=0.8, alpha=0.5, label='Raw')
-    ax3.plot(time, orientation_angle_smooth, 'g-', linewidth=1.5, label=f'Smoothed (window={smooth_window})')
-    ax3.set_ylabel('Orientation angle (°)\n(relative to negative x-axis)', fontsize=12)
-    ax3.set_ylim(-200, 200)  # Set y-limits to show full range of angles
-    ax3.legend(loc='upper right')
+    # Plot 2: Bend angle with behavioral state highlighting
+    ax2.plot(time, angle_upper_lower_deg, 'gray', alpha=0.3, label='Raw')
+    ax2.plot(time, bend_angle_smooth, 'r-', linewidth=1.5, label='Smoothed')
     
-    # Plot 4: Angle upper-lower
-    ax4.plot(time, angle_upper_lower_deg, 'k-', linewidth=1.5)
-    ax4.set_xlabel('Time (seconds)', fontsize=12)
-    ax4.set_ylabel('Angle upper-lower (°)', fontsize=12)
+    # Plot velocity on second y-axis
+    ax2b = ax2.twinx()
+    ax2b.plot(time, velocity, 'b-', linewidth=1.0, alpha=0.6, label='Motion velocity')
+    ax2b.axhline(y=velocity_run_threshold, color='b', linestyle='--', alpha=0.5, 
+                label=f'Run threshold: {velocity_run_threshold}')
+    ax2b.set_ylabel('Motion velocity', color='b')
+    ax2b.tick_params(axis='y', labelcolor='b')
     
-    # Add peaks as stars on upper-lower angle plot if requested
-    if highlight_peaks:
-        # Plot positive peaks as upward-pointing stars
-        if len(pos_peak_times) > 0:
-            ax4.plot(pos_peak_times, pos_peak_values, '*', color='red', markersize=12, 
-                    label=f'Right bend peaks (n={len(pos_peak_times)})')
-        
-        # Plot negative peaks as downward-pointing stars
-        if len(neg_peak_times) > 0:
-            ax4.plot(neg_peak_times, neg_peak_values, '*', color='blue', markersize=12, 
-                    label=f'Left bend peaks (n={len(neg_peak_times)})')
-        
-        if len(pos_peak_times) > 0 or len(neg_peak_times) > 0:
-            ax4.legend(loc='upper right')
+    # Add legend for both lines
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2b.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
     
-    # Add behavioral state highlighting to all plots
+    ax2.set_ylabel('Body bend angle (°)', color='r')
+    ax2.tick_params(axis='y', labelcolor='r')
+    ax2.set_title('Body Bend Angle with Behavioral States')
+    
+    # Add behavioral state highlighting to the second plot
     for i in range(1, 8):  # For each behavior state (1-7)
         # Find continuous segments of this behavior
         behavior_segments = []
@@ -4167,65 +4759,98 @@ def plot_larva_angle_dynamics(trx_data, larva_id=None, smooth_window=5, highligh
         if in_segment:
             behavior_segments.append((segment_start, len(states)-1))
         
-        # Highlight each segment on all plots
+        # Highlight each segment on the middle plot
         for start, end in behavior_segments:
             if end > start:  # Check for valid segment
                 color = behavior_colors[i]
                 alpha = 0.3
-                
-                # Highlight on all plots
-                ax1.axvspan(time[start], time[end], color=color, alpha=alpha)
                 ax2.axvspan(time[start], time[end], color=color, alpha=alpha)
-                ax3.axvspan(time[start], time[end], color=color, alpha=alpha)
-                ax4.axvspan(time[start], time[end], color=color, alpha=alpha)
     
-    # Add explanatory annotations
-    ax1.text(time[0], ax1.get_ylim()[1]*0.9, "Positive = bend to right\nNegative = bend to left", 
-             fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
-    ax2.text(time[0], ax2.get_ylim()[1]*0.9, "Positive = bend to right\nNegative = bend to left", 
-             fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
-    ax3.text(time[0], 150, "0° = neg. x-axis\n±180° = pos. x-axis\n+90° = right\n-90° = left", 
-             fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+    # Plot 3: Bend angle with head sweep classification
+    ax3.plot(time, bend_angle_smooth, 'k-', linewidth=1.0)
+    ax3.set_ylabel('Body bend angle (°)')
+    ax3.set_xlabel('Time (seconds)')
+    ax3.set_title('Body Bend Angle with Head Sweep Classification')
     
-    # Add behavior legend
-    legend_elements = [
+    # Add threshold reference lines to third plot
+    ax3.axhline(y=sweep_start_threshold, color='blue', linestyle='-', alpha=0.5)
+    ax3.axhline(y=-sweep_start_threshold, color='blue', linestyle='-', alpha=0.5)
+    ax3.axhline(y=sweep_end_threshold, color='cyan', linestyle='--', alpha=0.5)
+    ax3.axhline(y=-sweep_end_threshold, color='cyan', linestyle='--', alpha=0.5)
+    
+    # Highlight run and turn segments
+    for run_start, run_end in run_segments:
+        ax3.axvspan(time[run_start], time[run_end], 
+                   color=sweep_colors['run'], alpha=0.3)
+    
+    for turn_start, turn_end in turn_segments:
+        ax3.axvspan(time[turn_start], time[turn_end], 
+                   color=sweep_colors['turn'], alpha=0.3)
+    
+    # Highlight accepted head sweeps (on top of the run/turn highlighting)
+    for sweep_start, sweep_end in accepted_sweeps:
+        ax3.axvspan(time[sweep_start], time[sweep_end],
+                   color=sweep_colors['accepted_sweep'], alpha=0.7)
+    
+    # Highlight rejected head sweeps (also on top of the run/turn highlighting)
+    for sweep_start, sweep_end in rejected_sweeps:
+        ax3.axvspan(time[sweep_start], time[sweep_end],
+                   color=sweep_colors['rejected_sweep'], alpha=0.7)
+    
+    # Create legends for both sets of colors
+    # Legend for behavioral states
+    behavior_legend_elements = [
         Patch(facecolor=behavior_colors[i], alpha=0.3, 
               edgecolor='none', label=behavior_labels[i])
         for i in range(1, 8) if i in behavior_colors
     ]
-    fig.legend(handles=legend_elements, loc='lower center', 
-              title='Behaviors', ncol=4, fontsize=10, bbox_to_anchor=(0.5, 0))
     
+    # Legend for head sweep classification
+    sweep_legend_elements = [
+        Patch(facecolor=sweep_colors['run'], alpha=0.3, 
+              edgecolor='none', label='Run (velocity > threshold)'),
+        Patch(facecolor=sweep_colors['turn'], alpha=0.3, 
+              edgecolor='none', label='Turn (between runs)'),
+        Patch(facecolor=sweep_colors['accepted_sweep'], alpha=0.7, 
+              edgecolor='none', label='Accepted head sweep'),
+        Patch(facecolor=sweep_colors['rejected_sweep'], alpha=0.7, 
+              edgecolor='none', label='Rejected head sweep'),
+        Line2D([0], [0], color='blue', linestyle='-', alpha=0.5, 
+              label=f'Sweep start threshold (±{sweep_start_threshold}°)'),
+        Line2D([0], [0], color='cyan', linestyle='--', alpha=0.5, 
+              label=f'Sweep end threshold (±{sweep_end_threshold}°)')
+    ]
+    
+    # Add the legends in a two-row layout at the bottom
+    fig.legend(handles=behavior_legend_elements, loc='lower center', 
+              title='Behavioral States', ncol=4, fontsize=9, 
+              bbox_to_anchor=(0.5, 0.01))
+    
+    # Add the sweep classification legend below the behavior legend
+    fig.legend(handles=sweep_legend_elements, loc='lower center', 
+              title='Head Sweep Classification', ncol=3, fontsize=9, 
+              bbox_to_anchor=(0.5, 0.10))
+    
+    # Format plot
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.12)  # Make room for the legend
+    plt.suptitle(f'Combined Behavioral Analysis for Larva {larva_id}', fontsize=14, y=1.02)
+    plt.subplots_adjust(bottom=0.22)  # Make room for the two legends
+    
     plt.show()
     
-    print(f"Plotted angle dynamics for larva {larva_id} over {time[-1] - time[0]:.1f} seconds")
-    if highlight_peaks:
-        print(f"Detected {len(pos_peak_times)} right bend peaks and {len(neg_peak_times)} left bend peaks during cast/bend events")
-    
-    # Return calculated angles and detected peaks for further analysis
+    # Return results for further analysis
     return {
-        "larva_id": larva_id,
-        "time": time,
-        "angle_neck": angle_neck,
-        "angle_neck_smooth": angle_neck_smooth,
-        "angle_center": angle_center,
-        "angle_center_smooth": angle_center_smooth,
-        "orientation_angle": orientation_angle,
-        "orientation_angle_smooth": orientation_angle_smooth,
-        "angle_upper_lower": angle_upper_lower_deg,
-        "states": states,
-        "peaks": {
-            "positive": {
-                "times": pos_peak_times,
-                "values": pos_peak_values
-            },
-            "negative": {
-                "times": neg_peak_times,
-                "values": neg_peak_values
-            }
-        } if highlight_peaks else None
+        'larva_id': larva_id,
+        'time': time,
+        'orientation_smooth': orientation_smooth,
+        'bend_angle_smooth': bend_angle_smooth,
+        'velocity': velocity,
+        'run_segments': run_segments,
+        'turn_segments': turn_segments,
+        'accepted_sweeps': accepted_sweeps,
+        'rejected_sweeps': rejected_sweeps,
+        'states': states,
+        'bend_peaks': filtered_peaks
     }
 
 def plot_larva_angle_vectors(trx_data, larva_id=None, smooth_window=5, time_window=50):
@@ -4421,7 +5046,7 @@ def plot_larva_angle_vectors(trx_data, larva_id=None, smooth_window=5, time_wind
     ax1.set_rlim(0, 1.2)  # Set radius limit
     
     # Add cardinal direction labels with upstream/downstream
-    ax1.set_xticklabels(['90°\n(Right)', '45°', '0°\n(Downstream)', '-45°', '-90°\n(Left)', '-135°', '±180°\n(Upstream)', '135°'])
+    ax1.set_xticklabels(['0°\n(Downstream)', '45°', '90°\n(Right)', '135°', '±180°\n(Upstream)', '-135','-90°\n(Left)', '-45°'])
     
     # Prepare the orientation angle plot (top right)
     ax2.plot(time, orientation_angles_smooth, 'b-', linewidth=1.5)
@@ -8148,4 +8773,1743 @@ def compare_cast_directions_new(genotype1_data, genotype2_data, labels=None, ang
             'genotype2': genotype2_results
         },
         'orientation_curve_stats': orientation_stats
+    }
+
+
+def plot_angle_timeseries_with_polar(trx_data, larva_id=None, smooth_window=5, jump_threshold=15):
+    """
+    Create a dual-view visualization of orientation angles:
+    1. Linear time series (top) - shows angle changes with unwrapping to avoid jumps
+    2. Animated polar representation (bottom) - shows angle on a circle with time indication
+    
+    Parameters:
+    -----------
+    trx_data : dict
+        The tracking data dictionary
+    larva_id : str or int, optional
+        ID of specific larva to analyze, if None, selects a random larva
+    smooth_window : int
+        Window size for smoothing
+    jump_threshold : float
+        Threshold for detecting orientation jumps in degrees/frame
+    """
+    from scipy.ndimage import gaussian_filter1d
+    from ipywidgets import interact, IntSlider
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import random
+    
+    # Select larva if not specified
+    if larva_id is None:
+        larva_id = random.choice(list(trx_data.keys()))
+        print(f"Selected random larva: {larva_id}")
+    
+    # Extract larva data
+    larva_data = trx_data[larva_id]
+    if 'data' in larva_data:
+        larva_data = larva_data['data']
+    
+    # Extract required data fields
+    time = np.array(larva_data['t']).flatten()
+    states = np.array(larva_data['global_state_large_state']).flatten()
+    
+    # Get orientation angles
+    x_center = np.array(larva_data['x_center']).flatten()
+    y_center = np.array(larva_data['y_center']).flatten()
+    x_spine = np.array(larva_data['x_spine'])
+    y_spine = np.array(larva_data['y_spine'])
+    
+    if x_spine.ndim > 1:  # 2D array
+        x_tail = x_spine[-1].flatten()
+        y_tail = y_spine[-1].flatten()
+    else:  # 1D array
+        x_tail = x_spine
+        y_tail = y_spine
+    
+    # Calculate orientation angles
+    orientation_angles = []
+    for i in range(len(x_center)):
+        vector = np.array([x_center[i] - x_tail[i], y_center[i] - y_tail[i]])
+        if np.linalg.norm(vector) == 0:
+            orientation_angles.append(np.nan)
+        else:
+            angle_deg = np.degrees(np.arctan2(vector[1], -vector[0]))
+            orientation_angles.append(angle_deg)
+    
+    orientation_angles = np.array(orientation_angles)
+    
+    # Smooth the angles
+    orientation_smooth = gaussian_filter1d(orientation_angles, smooth_window/3.0)
+    
+    # Unwrap angles to remove discontinuities at -180/180 boundary
+    orientation_rad = np.radians(orientation_smooth)
+    unwrapped_rad = np.unwrap(orientation_rad)
+    unwrapped_deg = np.degrees(unwrapped_rad)
+    
+    # Create the figure with two subplots - FIXED: Create polar subplot correctly
+    fig = plt.figure(figsize=(10, 10))
+    gs = fig.add_gridspec(2, 1, height_ratios=[2, 2])
+    
+    # Regular cartesian subplot for time series
+    ax1 = fig.add_subplot(gs[0])
+    
+    # Polar subplot for the angle visualization
+    ax2 = fig.add_subplot(gs[1], projection='polar')
+    
+    # Set up the time series plot
+    ax1.plot(time, orientation_smooth, 'k-', alpha=0.5, label='Original')
+    ax1.plot(time, unwrapped_deg, 'b-', linewidth=1.5, label='Unwrapped')
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Orientation (°)')
+    ax1.set_title(f'Orientation Time Series - Larva {larva_id}')
+    ax1.legend(loc='upper right')
+    
+    # Add reference lines
+    ax1.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+    ax1.axhline(y=180, color='gray', linestyle='--', alpha=0.3)
+    ax1.axhline(y=-180, color='gray', linestyle='--', alpha=0.3)
+    
+    # Set up the polar plot
+    ax2.set_theta_zero_location('N')  # 0 at top
+    ax2.set_theta_direction(-1)  # clockwise
+    ax2.set_rticks([])  # No radial ticks
+    ax2.set_rlim(0, 1.2)
+    ax2.set_title('Orientation on Polar Plot')
+    
+    # Add cardinal direction labels
+    directions = ['Upstream (0°)', 'Right (90°)', 'Downstream (180°)', 'Left (270°)']
+    angles = np.radians([0, 90, 180, 270])
+    for direction, angle in zip(directions, angles):
+        ax2.text(angle, 1.1, direction, ha='center', va='center', fontsize=9)
+    
+    # Time marker for time series
+    time_line = ax1.axvline(x=time[0], color='r', linewidth=1.5)
+    
+    # Current angle arrow for polar plot
+    arrow = ax2.annotate('', xy=(orientation_rad[0], 1), xytext=(0, 0),
+                       arrowprops=dict(arrowstyle='->', color='r', lw=2))
+    
+    # Add past trajectory with color gradient
+    n_history = 100  # Number of past points to show
+    points = []
+    for i in range(min(n_history, len(orientation_rad))):
+        alpha = (i + 1) / n_history  # Fade out older points
+        point, = ax2.plot([orientation_rad[i]], [1], 'o', ms=3, 
+                         color='blue', alpha=alpha * 0.5)
+        points.append(point)
+    
+    # Interactive slider to move through time
+    def update(frame):
+        # Update time marker
+        time_line.set_xdata([time[frame], time[frame]])
+        
+        # Update arrow direction
+        angle = orientation_rad[frame]
+        arrow.xy = (angle, 1)
+        
+        # Update trajectory
+        for i, point in enumerate(points):
+            idx = max(0, frame - n_history + i + 1)
+            if idx < frame:
+                point.set_data([orientation_rad[idx]], [1])
+                alpha = (i + 1) / n_history
+                point.set_alpha(alpha * 0.5)
+            else:
+                point.set_data([], [])
+        
+        plt.draw()
+    
+    # Create slider widget
+    slider = IntSlider(min=0, max=len(time)-1, step=1, value=0,
+                     description='Time Frame:',
+                     layout={'width': '100%'})
+    
+    # Connect the slider to the update function
+    interact(update, frame=slider)
+    
+    plt.tight_layout()
+    return {
+        'time': time,
+        'orientation_smooth': orientation_smooth,
+        'unwrapped_deg': unwrapped_deg,
+        'fig': fig
+    }
+
+
+def plot_polar_angles_scatter(trx_data, larva_id=None, smooth_window=5, jump_threshold=15, color_by='time', cmap='viridis'):
+    """
+    Create two polar scatter plots with randomized radii:
+    1. Orientation angle scatter plot
+    2. Body bend angle scatter plot
+    
+    Points are colored by time or behavior state using a colormap.
+    
+    Parameters:
+    -----------
+    trx_data : dict
+        The tracking data dictionary
+    larva_id : str or int, optional
+        ID of specific larva to analyze, if None, selects a random larva
+    smooth_window : int
+        Window size for smoothing
+    jump_threshold : float
+        Threshold for detecting orientation jumps in degrees/frame
+    color_by : str
+        'time' to color by time progression, 'behavior' to color by behavioral state
+    cmap : str or matplotlib.colors.Colormap
+        Colormap to use for coloring points (when color_by='time')
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import random
+    from scipy.ndimage import gaussian_filter1d
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    
+    # Define behavior color scheme
+    behavior_colors = {
+        1: [0.0, 0.0, 0.0],      # Black (for Run/Crawl)
+        2: [1.0, 0.0, 0.0],      # Red (for Cast/Bend)
+        3: [0.0, 1.0, 0.0],      # Green (for Stop)
+        4: [0.0, 0.0, 1.0],      # Blue (for Hunch)
+        5: [1.0, 0.5, 0.0],      # Orange (for Backup)
+        6: [0.5, 0.0, 0.5],      # Purple (for Roll)
+        7: [0.7, 0.7, 0.7]       # Light gray (for Small Actions)
+    }
+    
+    # Behavior labels for legend
+    behavior_labels = {
+        1: 'Run/Crawl',
+        2: 'Cast/Bend',
+        3: 'Stop',
+        4: 'Hunch',
+        5: 'Backup',
+        6: 'Roll',
+        7: 'Small Actions'
+    }
+    
+    # Helper function to calculate orientation angle (relative to negative x-axis)
+    def calculate_orientation_angle(vector):
+        """
+        Calculate angle between vector and negative x-axis in degrees.
+        0° = aligned with negative x-axis (downstream), 180° = aligned with positive x-axis (upstream)
+        +90° = pointing right (y-axis), -90° = pointing left (negative y-axis)
+        """
+        if np.linalg.norm(vector) == 0:
+            return np.nan
+            
+        # Calculate angle with negative x-axis using arctan2
+        angle_deg = np.degrees(np.arctan2(vector[1], -vector[0]))
+        
+        return angle_deg
+    
+    # Helper function to smooth data
+    def smooth_data(data, window_size):
+        """Apply Gaussian smoothing to data"""
+        sigma = window_size / 3.0  # Approximately equivalent to moving average
+        return gaussian_filter1d(data, sigma)
+    
+    # Select larva if not specified
+    if larva_id is None:
+        larva_id = random.choice(list(trx_data.keys()))
+        print(f"Selected random larva: {larva_id}")
+    
+    # Extract larva data
+    larva_data = trx_data[larva_id]
+    if 'data' in larva_data:
+        larva_data = larva_data['data']
+    
+    # Extract required data fields
+    time = np.array(larva_data['t']).flatten()
+    states = np.array(larva_data['global_state_large_state']).flatten()
+    
+    # Extract coordinates for angle calculations
+    x_spine = np.array(larva_data['x_spine'])
+    y_spine = np.array(larva_data['y_spine'])
+    x_center = np.array(larva_data['x_center']).flatten()
+    y_center = np.array(larva_data['y_center']).flatten()
+    
+    # Handle different spine data shapes
+    if x_spine.ndim == 1:  # 1D array
+        x_tail = x_spine
+        y_tail = y_spine
+    else:  # 2D array with shape (spine_points, frames)
+        x_tail = x_spine[-1].flatten()
+        y_tail = y_spine[-1].flatten()
+    
+    # Calculate tail-to-center vectors and orientation angles
+    tail_to_center_vectors = []
+    orientation_angles = []
+    for i in range(len(x_center)):
+        vector = np.array([x_center[i] - x_tail[i], y_center[i] - y_tail[i]])
+        tail_to_center_vectors.append(vector)
+        orientation_angles.append(calculate_orientation_angle(vector))
+    
+    # Get upper-lower bend angle
+    angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
+    angle_upper_lower_deg = np.degrees(angle_upper_lower)
+    
+    # Convert to numpy arrays
+    orientation_angles = np.array(orientation_angles)
+    
+    # Apply smoothing
+    orientation_angles_smooth = smooth_data(orientation_angles, smooth_window)
+    angle_upper_lower_deg_smooth = smooth_data(angle_upper_lower_deg, smooth_window)
+    
+    # Ensure all arrays have the same length
+    min_length = min(len(time), len(orientation_angles_smooth), len(angle_upper_lower_deg_smooth), len(states))
+    time = time[:min_length]
+    orientation_angles_smooth = orientation_angles_smooth[:min_length]
+    angle_upper_lower_deg_smooth = angle_upper_lower_deg_smooth[:min_length]
+    states = states[:min_length]
+    
+    # Generate random radii between 0.5 and 1.0
+    np.random.seed(42)  # For reproducibility
+    random_radii = 0.5 + 0.5 * np.random.random(min_length)
+    
+    # Create figure with two polar subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7), subplot_kw={'projection': 'polar'})
+    
+    # Prepare colors based on time or behavior
+    if color_by == 'behavior':
+        # Use behavior states for coloring
+        colors = np.array([behavior_colors.get(int(state), [0.5, 0.5, 0.5]) for state in states])
+        color_values = states
+    else:  # default to time
+        # Use time for coloring
+        cmap_obj = plt.get_cmap(cmap)
+        norm_time = (time - np.min(time)) / (np.max(time) - np.min(time)) if np.max(time) > np.min(time) else np.zeros_like(time)
+        colors = cmap_obj(norm_time)
+        color_values = time
+    
+    # Convert angles to radians for polar plots
+    orientation_rad = np.radians(orientation_angles_smooth)
+    bend_rad = np.radians(angle_upper_lower_deg_smooth)
+    
+    # 1. Plot orientation angles on polar plot with random radii
+    if color_by == 'behavior':
+        scatter1 = ax1.scatter(orientation_rad, random_radii, 
+                              c=color_values, cmap=plt.cm.colors.ListedColormap(list(behavior_colors.values())),
+                              s=3, alpha=0.5)
+    else:
+        scatter1 = ax1.scatter(orientation_rad, random_radii, 
+                              c=color_values, cmap=cmap, s=3, alpha=0.5)
+    
+    # Configure orientation plot
+    ax1.set_title('Orientation Angle', fontsize=12)
+    ax1.set_theta_zero_location('E')  # 0 at right (East)
+    ax1.set_theta_direction(1)       # counterclockwise
+    
+    # Set radius ticks off
+    ax1.set_rticks([])
+    ax1.set_rlim(0, 1.2)
+    
+    # Add cardinal direction labels with upstream/downstream
+    ax1.set_xticklabels(['0°\n(Downstream)', '45°', '90°\n(Right)', '135°', 
+                         '±180°\n(Upstream)', '-135°', '-90°\n(Left)', '-45°'])
+    
+    # 2. Plot bend angle on polar plot with random radii
+    # Use the same random radii for consistency (or generate new ones if preferred)
+    if color_by == 'behavior':
+        scatter2 = ax2.scatter(bend_rad, random_radii, 
+                              c=color_values, cmap=plt.cm.colors.ListedColormap(list(behavior_colors.values())),
+                              s=3, alpha=0.5)
+    else:
+        scatter2 = ax2.scatter(bend_rad, random_radii, 
+                              c=color_values, cmap=cmap, s=3, alpha=0.5)
+    
+    # Configure bend angle plot
+    ax2.set_title('Body Bend Angle', fontsize=12)
+    ax2.set_theta_zero_location('E')  # 0 at right (East)
+    ax2.set_theta_direction(1)       # counterclockwise
+    
+    # Set radius ticks off
+    ax2.set_rticks([])
+    ax2.set_rlim(0, 1.2)
+    
+    # Add labels for the bend angle plot
+    ax2.set_xticklabels(['0°\n(No Bend)', '45°\n(Right)', '90°\n(Right)', '135°\n(Right)', 
+                        '±180°', '-135°\n(Left)', '-90°\n(Left)', '-45°\n(Left)'])
+    
+    # Add colorbar or legend
+    if color_by == 'behavior':
+        # Create legend for behavior states
+        unique_states = np.unique(states).astype(int)
+        behavior_legend_elements = [
+            Patch(facecolor=behavior_colors.get(state, [0.5, 0.5, 0.5]), 
+                 alpha=0.8, label=behavior_labels.get(state, f'State {state}'))
+            for state in unique_states
+        ]
+        fig.legend(handles=behavior_legend_elements, loc='lower center', 
+                  bbox_to_anchor=(0.5, 0), ncol=min(len(behavior_legend_elements), 4), fontsize=9)
+    else:
+        # Add colorbar for time
+        sm = plt.cm.ScalarMappable(cmap=cmap)
+        sm.set_array(time)
+        cbar = plt.colorbar(sm, ax=[ax1, ax2], orientation='horizontal', pad=0.1)
+        cbar.set_label('Time (seconds)')
+    
+    # Add vector legend
+    vector_legend = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='b', markersize=10, 
+              label='Orientation Vector', alpha=0.8),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='r', markersize=10, 
+              label='Bend Angle Vector', alpha=0.8)
+    ]
+    
+    # Add vector legend between the plots
+    fig.legend(handles=vector_legend, loc='upper center', 
+              bbox_to_anchor=(0.5, 0.05), ncol=2, fontsize=9)
+    
+    plt.suptitle(f'Polar Angle Distributions for Larva {larva_id}', fontsize=14)
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.2 if color_by == 'behavior' else 0.15)
+    
+    return {
+        'larva_id': larva_id,
+        'time': time,
+        'orientation_angles_smooth': orientation_angles_smooth,
+        'angle_upper_lower_deg_smooth': angle_upper_lower_deg_smooth,
+        'states': states,
+        'fig': fig
+    }
+
+
+
+def compare_cast_directions_peaks(genotype1_data, genotype2_data, labels=None, angle_width=5, 
+                                 smooth_window=5, jump_threshold=15, basepath=None):
+    """
+    Compare upstream and downstream cast distributions between two genotypes when larvae are perpendicular to flow.
+    Uses sophisticated peak detection and classification from bend angles to identify cast events and their directions.
+    
+    Parameters:
+    -----------
+    genotype1_data : dict
+        Tracking data dictionary for first genotype
+    genotype2_data : dict
+        Tracking data dictionary for second genotype
+    labels : tuple, optional
+        Tuple of (label1, label2) for the genotypes
+    angle_width : int
+        Width of perpendicular orientation sector in degrees
+    smooth_window : int
+        Window size for smoothing (default=5)
+    jump_threshold : float
+        Threshold for detecting orientation jumps in degrees/frame (default=15)
+    basepath : str, optional
+        Base path for saving output files
+        
+    Returns:
+    --------
+    dict: Contains comparison statistics and test results
+    """
+    from scipy import stats
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import find_peaks
+    from datetime import datetime
+    from matplotlib.patches import Patch
+    
+    # Set default labels if not provided
+    if labels is None:
+        labels = ('Genotype 1', 'Genotype 2')
+    
+    # Create safe filenames from labels
+    label1_safe = ''.join(c if c.isalnum() else '_' for c in labels[0])
+    label2_safe = ''.join(c if c.isalnum() else '_' for c in labels[1])
+    
+    # Create timestamp for file names
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Make sure basepath exists
+    if basepath is not None:
+        import os
+        os.makedirs(basepath, exist_ok=True)
+    
+    # Define perpendicular angle ranges (both left and right sides)
+    # With wind blowing towards negative x, perpendicular is ±90°
+    left_perp_range = (-90 - angle_width, -90 + angle_width)
+    right_perp_range = (90 - angle_width, 90 + angle_width)
+    
+    def is_perpendicular(angle):
+        """Check if an angle is within the perpendicular ranges"""
+        return ((left_perp_range[0] <= angle <= left_perp_range[1]) or 
+                (right_perp_range[0] <= angle <= right_perp_range[1]))
+    
+    def analyze_peaks_in_genotype(genotype_data):
+        """Analyze cast peaks within a genotype using sophisticated filtering techniques"""
+        # Store per-larva counts
+        per_larva_counts = {
+            'small': {'upstream': [], 'downstream': [], 'larva_ids': [], 'total': []},
+            'large': {'upstream': [], 'downstream': [], 'larva_ids': [], 'total': []},
+            'all': {'upstream': [], 'downstream': [], 'larva_ids': [], 'total': []}
+        }
+        
+        # Store raw counts for analysis
+        total_counts = {
+            'small': {'upstream': 0, 'downstream': 0},
+            'large': {'upstream': 0, 'downstream': 0},
+            'all': {'upstream': 0, 'downstream': 0}
+        }
+        
+        # Store per-larva probabilities for box plot
+        larva_probabilities = {
+            'small': {'upstream': [], 'downstream': []},
+            'large': {'upstream': [], 'downstream': []},
+            'all': {'upstream': [], 'downstream': []}
+        }
+        
+        # Determine which data structure we're working with
+        if 'data' in genotype_data:
+            data_to_process = genotype_data['data']
+            n_larvae = genotype_data['metadata']['total_larvae']
+        else:
+            data_to_process = genotype_data
+            n_larvae = len(data_to_process)
+        
+        # Process each larva
+        larvae_processed = 0
+        for larva_id, larva_data in data_to_process.items():
+            # Extract nested data if needed
+            if 'data' in larva_data:
+                larva_data = larva_data['data']
+                
+            # Extract required data
+            try:
+                # Extract basic time series data
+                time = np.array(larva_data['t']).flatten()
+                states = np.array(larva_data['global_state_large_state']).flatten()
+                
+                # Check for small_large_state or fall back to large_state
+                has_small_large_state = 'global_state_small_large_state' in larva_data
+                
+                if has_small_large_state:
+                    # Extract both small and large cast states
+                    small_large_states = np.array(larva_data['global_state_small_large_state']).flatten()
+                    large_cast_mask = small_large_states == 2.0  # Large casts = 2.0
+                    small_cast_mask = small_large_states == 1.5  # Small casts = 1.5
+                else:
+                    # Fall back to just large state if small_large_state isn't available
+                    large_cast_mask = states == 2  # Only large casts available
+                    small_cast_mask = np.zeros_like(states, dtype=bool)  # No small casts
+                
+                any_cast_mask = large_cast_mask | small_cast_mask
+                
+                # Get orientation angles
+                # Calculate orientation from tail to center (negative x-axis is 0 degrees)
+                x_center = np.array(larva_data['x_center']).flatten()
+                y_center = np.array(larva_data['y_center']).flatten()
+                x_spine = np.array(larva_data['x_spine'])
+                y_spine = np.array(larva_data['y_spine'])
+                
+                if x_spine.ndim > 1:
+                    x_tail = x_spine[-1].flatten()
+                    y_tail = y_spine[-1].flatten()
+                else:
+                    x_tail = x_spine
+                    y_tail = y_spine
+                
+                # Calculate orientation vectors
+                dx = x_center - x_tail
+                dy = y_center - y_tail
+                orientation_angles = np.degrees(np.arctan2(dy, -dx))  # -dx because 0° is negative x-axis
+                
+                # Get upper-lower bend angle
+                angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
+                angle_upper_lower_deg = np.degrees(angle_upper_lower)
+                
+                # Ensure all arrays have the same length
+                min_length = min(len(time), len(orientation_angles), len(angle_upper_lower_deg), len(states))
+                time = time[:min_length]
+                orientation_angles = orientation_angles[:min_length]
+                angle_upper_lower_deg = angle_upper_lower_deg[:min_length]
+                states = states[:min_length]
+                large_cast_mask = large_cast_mask[:min_length]
+                small_cast_mask = small_cast_mask[:min_length]
+                any_cast_mask = any_cast_mask[:min_length]
+                
+                # ==== FILTERING AND PROCESSING ====
+                
+                # 1. Orientation angle jump detection and correction
+                orientation_raw = orientation_angles.copy()
+                
+                # Calculate derivative to detect jumps
+                orientation_diff = np.abs(np.diff(orientation_angles))
+                # Add zero at the beginning to match length
+                orientation_diff = np.insert(orientation_diff, 0, 0)
+                
+                # Find jumps bigger than threshold
+                jumps = orientation_diff > jump_threshold
+                
+                # Create masked array for plotting
+                orientation_masked = np.ma.array(orientation_angles, mask=jumps)
+                
+                # Apply Gaussian smoothing to the filtered data
+                # First interpolate masked values for smoothing
+                orientation_interp = orientation_masked.filled(np.nan)
+                mask = np.isnan(orientation_interp)
+                
+                # Only interpolate if we have valid data
+                if np.sum(~mask) > 1:
+                    indices = np.arange(len(orientation_interp))
+                    valid_indices = indices[~mask]
+                    valid_values = orientation_interp[~mask]
+                    orientation_interp[mask] = np.interp(indices[mask], valid_indices, valid_values)
+                
+                # Apply smoothing
+                orientation_smooth = gaussian_filter1d(orientation_interp, smooth_window/3.0)
+                
+                # 2. Intelligent peak detection for bend angle
+                # Calculate slope changes
+                bend_angle_diff = np.diff(angle_upper_lower_deg)
+                # Add zero at the beginning to match length
+                bend_angle_diff = np.insert(bend_angle_diff, 0, 0)
+                
+                # Smooth the bend angle
+                bend_angle_smooth = gaussian_filter1d(angle_upper_lower_deg, smooth_window/3.0)
+                
+                # Find peaks with intelligent filtering:
+                # - Ignore peaks that start from flat regions (slope near zero)
+                # - Require minimum height and prominence
+                pos_peaks, _ = find_peaks(
+                    bend_angle_smooth, 
+                    height=5,        
+                    prominence=3,        
+                    distance=5
+                )
+                
+                neg_peaks, _ = find_peaks(
+                    -bend_angle_smooth, 
+                    height=5,        
+                    prominence=3,        
+                    distance=5
+                )
+                
+                # Combine positive and negative peaks
+                all_peaks = np.union1d(pos_peaks, neg_peaks)
+                
+                # Filter out peaks that start from flat regions
+                slope_threshold = 0.5  # Define what's considered "flat"
+                filtered_peaks = []
+                for peak in all_peaks:
+                    if peak > 0 and abs(bend_angle_diff[peak-1]) > slope_threshold:
+                        filtered_peaks.append(peak)
+                
+                # Storage for cast counts
+                larva_cast_counts = {
+                    'large': {'upstream': 0, 'downstream': 0},
+                    'small': {'upstream': 0, 'downstream': 0},
+                    'all': {'upstream': 0, 'downstream': 0}
+                }
+                
+                # Process each peak to classify as upstream or downstream
+                for peak in filtered_peaks:
+                    # Only consider peaks during cast behaviors that are perpendicular to flow
+                    is_large_cast = large_cast_mask[peak]
+                    is_small_cast = small_cast_mask[peak]
+                    is_any_cast = any_cast_mask[peak]
+                    is_perp = is_perpendicular(orientation_smooth[peak])
+                    
+                    if is_perp:  # Only analyze peaks when orientation is perpendicular
+                        # Get orientation at time of peak (after smoothing)
+                        orientation = orientation_smooth[peak]
+                        bend_angle = bend_angle_smooth[peak]
+                        
+                        # Normalize orientation to -180 to 180 range
+                        while orientation > 180:
+                            orientation -= 360
+                        while orientation <= -180:
+                            orientation += 360
+                        
+                        # Classify as upstream or downstream based on orientation and bend direction
+                        # Classify based on orientation and bend direction
+                        is_upstream = False
+                        if (orientation > 0 and orientation < 180):  # Right side (positive orientation)
+                            if bend_angle < 0:  # Negative bend is upstream
+                                is_upstream = True
+                            else:  # Positive bend is downstream
+                                is_upstream = False
+                        else:  # Left side (negative orientation)
+                            if bend_angle > 0:  # Positive bend is upstream
+                                is_upstream = True
+                            else:  # Negative bend is downstream
+                                is_upstream = False
+                        
+                        # Update cast counts
+                        cast_direction = 'upstream' if is_upstream else 'downstream'
+                        
+                        if is_large_cast:
+                            larva_cast_counts['large'][cast_direction] += 1
+                        if is_small_cast:
+                            larva_cast_counts['small'][cast_direction] += 1
+                        if is_any_cast:
+                            larva_cast_counts['all'][cast_direction] += 1
+                
+                # Only count larvae with at least one cast in perpendicular orientation
+                has_casts = False
+                for cast_type in ['large', 'small', 'all']:
+                    upstream = larva_cast_counts[cast_type]['upstream']
+                    downstream = larva_cast_counts[cast_type]['downstream']
+                    total = upstream + downstream
+                    
+                    if total >= 3:  # Require at least 3 casts for reliable probability
+                        has_casts = True
+                        
+                        # Add to total counts
+                        total_counts[cast_type]['upstream'] += upstream
+                        total_counts[cast_type]['downstream'] += downstream
+                        
+                        # Add to per-larva counts
+                        per_larva_counts[cast_type]['upstream'].append(upstream)
+                        per_larva_counts[cast_type]['downstream'].append(downstream)
+                        per_larva_counts[cast_type]['total'].append(total)
+                        per_larva_counts[cast_type]['larva_ids'].append(str(larva_id))
+                        
+                        # Calculate and store probability
+                        upstream_prob = upstream / total
+                        downstream_prob = downstream / total
+                        larva_probabilities[cast_type]['upstream'].append(upstream_prob)
+                        larva_probabilities[cast_type]['downstream'].append(downstream_prob)
+                
+                if has_casts:
+                    larvae_processed += 1
+                
+            except Exception as e:
+                print(f"Error processing larva {larva_id}: {e}")
+        
+        # Calculate overall probabilities for each cast type
+        probabilities = {}
+        for cast_type in ['small', 'large', 'all']:
+            upstream = total_counts[cast_type]['upstream']
+            downstream = total_counts[cast_type]['downstream']
+            total = upstream + downstream
+            
+            if total > 0:
+                probabilities[cast_type] = {
+                    'upstream': upstream / total,
+                    'downstream': downstream / total
+                }
+            else:
+                probabilities[cast_type] = {
+                    'upstream': 0,
+                    'downstream': 0
+                }
+        
+        # Calculate mean probabilities from per-larva data
+        mean_probabilities = {}
+        sem_probabilities = {}  # Standard error of mean
+        for cast_type in ['small', 'large', 'all']:
+            up_probs = np.array(larva_probabilities[cast_type]['upstream'])
+            down_probs = np.array(larva_probabilities[cast_type]['downstream'])
+            
+            if len(up_probs) > 0:
+                mean_probabilities[cast_type] = {
+                    'upstream': np.mean(up_probs),
+                    'downstream': np.mean(down_probs)
+                }
+                sem_probabilities[cast_type] = {
+                    'upstream': stats.sem(up_probs) if len(up_probs) > 1 else 0,
+                    'downstream': stats.sem(down_probs) if len(down_probs) > 1 else 0
+                }
+            else:
+                mean_probabilities[cast_type] = {'upstream': 0, 'downstream': 0}
+                sem_probabilities[cast_type] = {'upstream': 0, 'downstream': 0}
+        
+        # Statistical tests for each cast type
+        stats_results = {}
+        for cast_type in ['small', 'large', 'all']:
+            upstream_probs = np.array(larva_probabilities[cast_type]['upstream'])
+            downstream_probs = np.array(larva_probabilities[cast_type]['downstream'])
+            
+            if len(upstream_probs) > 0:
+                # One-sample t-test against chance level (0.5)
+                tstat, pval = stats.ttest_1samp(upstream_probs, 0.5)
+                
+                # Add chi-square test on raw counts
+                observed = np.array([total_counts[cast_type]['upstream'], 
+                                    total_counts[cast_type]['downstream']])
+                expected = np.sum(observed) / 2  # Expected equal distribution
+                chi2, p_chi2 = stats.chisquare(observed)
+                
+                stats_results[cast_type] = {
+                    'ttest': {'tstat': tstat, 'pval': pval},
+                    'chisquare': {'chi2': chi2, 'pval': p_chi2},
+                    'n_larvae': len(upstream_probs),
+                    'n_upstream': total_counts[cast_type]['upstream'],
+                    'n_downstream': total_counts[cast_type]['downstream']
+                }
+            else:
+                stats_results[cast_type] = {
+                    'ttest': {'tstat': float('nan'), 'pval': float('nan')},
+                    'chisquare': {'chi2': float('nan'), 'pval': float('nan')},
+                    'n_larvae': 0,
+                    'n_upstream': 0,
+                    'n_downstream': 0
+                }
+        
+        return {
+            'total_counts': total_counts,
+            'probabilities': probabilities,
+            'mean_probabilities': mean_probabilities,
+            'sem_probabilities': sem_probabilities,
+            'larva_probabilities': larva_probabilities,
+            'per_larva_counts': per_larva_counts,
+            'stats_results': stats_results,
+            'larvae_processed': larvae_processed,
+            'total_larvae': n_larvae,
+            'angle_width': angle_width
+        }
+    
+    # Analyze both genotypes separately
+    print(f"Analyzing {labels[0]}...")
+    genotype1_results = analyze_peaks_in_genotype(genotype1_data)
+    
+    print(f"Analyzing {labels[1]}...")
+    genotype2_results = analyze_peaks_in_genotype(genotype2_data)
+    
+    # Statistical comparison between genotypes
+    comparison_results = {
+        'angle_width': angle_width,
+        'labels': labels,
+        'statistical_tests': {},
+        'counts': {}
+    }
+    
+    # Cast types to analyze
+    cast_types = ['all', 'large', 'small']
+    
+    # Colors for each genotype
+    genotype_colors = {
+        labels[0]: {
+            'upstream': '#1f77b4',  # Blue
+            'downstream': '#9ecae1'  # Light blue
+        },
+        labels[1]: {
+            'upstream': '#d62728',   # Red
+            'downstream': '#ff9896'  # Light red
+        }
+    }
+    
+    # Count valid cast types (those with data in both genotypes)
+    valid_cast_types = []
+    for cast_type in cast_types:
+        if (len(genotype1_results['larva_probabilities'][cast_type]['upstream']) > 0 and
+            len(genotype2_results['larva_probabilities'][cast_type]['upstream']) > 0):
+            valid_cast_types.append(cast_type)
+    
+    n_cast_types = len(valid_cast_types)
+    
+    if n_cast_types == 0:
+        print("No cast data found in both genotypes. Skipping plots.")
+        return comparison_results
+    
+    # Create figure for comparison
+    fig, axes = plt.subplots(1, n_cast_types, figsize=(4.5 * n_cast_types, 6))
+    
+    # Handle the case of a single subplot
+    if n_cast_types == 1:
+        axes = [axes]
+    
+    # Variable to store statistical results for text file
+    stat_results_txt = []
+    stat_results_txt.append(f"Cast Direction Comparison: {labels[0]} vs {labels[1]}")
+    stat_results_txt.append(f"Analysis timestamp: {timestamp}")
+    stat_results_txt.append(f"Perpendicular angle width: ±{angle_width}°")
+    stat_results_txt.append(f"Using improved peak detection with jump_threshold={jump_threshold} and smooth_window={smooth_window}")
+    stat_results_txt.append("\n")
+    
+    # Process each cast type
+    for ax_idx, cast_type in enumerate(valid_cast_types):
+        # Get data for current cast type
+        g1_upstream = genotype1_results['larva_probabilities'][cast_type]['upstream']
+        g1_downstream = genotype1_results['larva_probabilities'][cast_type]['downstream']
+        g2_upstream = genotype2_results['larva_probabilities'][cast_type]['upstream']
+        g2_downstream = genotype2_results['larva_probabilities'][cast_type]['downstream']
+        
+        # Statistical tests for difference between genotypes
+        # Two-sample t-test for upstream probabilities
+        tstat, pval = stats.ttest_ind(g1_upstream, g2_upstream, equal_var=False)
+        comparison_results['statistical_tests'][f'{cast_type}_upstream'] = {
+            'tstat': tstat,
+            'pval': pval,
+            'n1': len(g1_upstream),
+            'n2': len(g2_upstream)
+        }
+        
+        # Add to text results
+        stat_results_txt.append(f"{cast_type.capitalize()} casts - Upstream probability comparison:")
+        stat_results_txt.append(f"  {labels[0]}: {np.mean(g1_upstream):.4f} ± {stats.sem(g1_upstream):.4f} (n={len(g1_upstream)})")
+        stat_results_txt.append(f"  {labels[1]}: {np.mean(g2_upstream):.4f} ± {stats.sem(g2_upstream):.4f} (n={len(g2_upstream)})")
+        stat_results_txt.append(f"  Two-sample t-test: t={tstat:.4f}, p={pval:.4f}")
+        
+        # Add raw count statistics for this cast type
+        g1_up_count = genotype1_results['total_counts'][cast_type]['upstream']
+        g1_down_count = genotype1_results['total_counts'][cast_type]['downstream']
+        g2_up_count = genotype2_results['total_counts'][cast_type]['upstream']
+        g2_down_count = genotype2_results['total_counts'][cast_type]['downstream']
+        
+        stat_results_txt.append(f"  Raw counts:")
+        stat_results_txt.append(f"    {labels[0]}: {g1_up_count} upstream, {g1_down_count} downstream")
+        stat_results_txt.append(f"    {labels[1]}: {g2_up_count} upstream, {g2_down_count} downstream")
+        
+        # One-sample t-test against chance (0.5) for each genotype
+        for label, data in [(labels[0], g1_upstream), (labels[1], g2_upstream)]:
+            tstat, pval = stats.ttest_1samp(data, 0.5)
+            stat_results_txt.append(f"  {label} vs chance (0.5): t={tstat:.4f}, p={pval:.4f}")
+        
+        stat_results_txt.append("")
+        
+        # Create the plot for this cast type
+        ax = axes[ax_idx]
+        
+        # Data for box plot
+        data = [g1_upstream, g1_downstream, g2_upstream, g2_downstream]
+        positions = [1, 2, 3.5, 4.5]
+        labels_box = [f'{labels[0]}\nUpstream', f'{labels[0]}\nDownstream', 
+                      f'{labels[1]}\nUpstream', f'{labels[1]}\nDownstream']
+        
+        # Create box plot
+        bp = ax.boxplot(data, positions=positions, notch=True, patch_artist=True, 
+                       widths=0.6, showfliers=False)
+        
+        # Color boxes by genotype and direction
+        colors = [genotype_colors[labels[0]]['upstream'], 
+                  genotype_colors[labels[0]]['downstream'],
+                  genotype_colors[labels[1]]['upstream'], 
+                  genotype_colors[labels[1]]['downstream']]
+        
+        for i, box in enumerate(bp['boxes']):
+            box.set(facecolor=colors[i], alpha=0.6)
+            bp['medians'][i].set(color='black', linewidth=1.5)
+        
+        # Add individual data points with jitter
+        for i, (pos, d) in enumerate(zip(positions, data)):
+            jitter = 0.1 * np.random.randn(len(d))
+            ax.scatter(pos + jitter, d, s=25, alpha=0.6, color=colors[i], 
+                      edgecolor='k', linewidth=0.5)
+        
+        # Add annotations: mean ± SEM
+        for i, (pos, d) in enumerate(zip(positions, data)):
+            if len(d) > 0:
+                mean = np.mean(d)
+                sem = stats.sem(d) if len(d) > 1 else 0
+                ax.text(pos, 1.05, f"{mean:.2f}±{sem:.2f}", ha='center', va='bottom',
+                       fontsize=8, bbox=dict(facecolor='white', alpha=0.8, pad=0.1))
+        
+        # Add raw count annotations for each population
+        ax.text(1, -0.05, f"n={g1_up_count}", ha='center', va='top', fontsize=8)
+        ax.text(2, -0.05, f"n={g1_down_count}", ha='center', va='top', fontsize=8)
+        ax.text(3.5, -0.05, f"n={g2_up_count}", ha='center', va='top', fontsize=8)
+        ax.text(4.5, -0.05, f"n={g2_down_count}", ha='center', va='top', fontsize=8)
+        
+        # Add p-value annotation between genotypes
+        # Comparison between genotypes (upstream probabilities)
+        pval = comparison_results['statistical_tests'][f'{cast_type}_upstream']['pval']
+        if pval < 0.001:
+            ptext = "p<0.001 ***"
+        elif pval < 0.01:
+            ptext = "p<0.01 **"
+        elif pval < 0.05:
+            ptext = f"p={pval:.3f} *"
+        else:
+            ptext = f"p={pval:.3f}"
+            
+        # Add horizontal line and p-value between genotype upstream probabilities
+        ax.plot([1, 3.5], [1.15, 1.15], 'k-', lw=1)
+        ax.text(2.25, 1.17, ptext, ha='center', va='bottom', fontsize=10)
+        
+        # Add significance markers for comparison to chance (0.5)
+        # For first genotype
+        pval_g1 = genotype1_results['stats_results'][cast_type]['ttest']['pval']
+        if pval_g1 < 0.05:
+            stars_g1 = "*" * sum([pval_g1 < p for p in [0.05, 0.01, 0.001]])
+            ax.text(1, 0.45, stars_g1, ha='center', va='top', fontsize=14)
+            
+        # For second genotype
+        pval_g2 = genotype2_results['stats_results'][cast_type]['ttest']['pval']
+        if pval_g2 < 0.05:
+            stars_g2 = "*" * sum([pval_g2 < p for p in [0.05, 0.01, 0.001]])
+            ax.text(3.5, 0.45, stars_g2, ha='center', va='top', fontsize=14)
+        
+        # Add a dashed line at 0.5 (chance level)
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7)
+        # Add significance markers for within-genotype comparison (upstream vs downstream)
+        # For first genotype (compare positions 1 and 2)
+        tstat_within_g1, pval_within_g1 = stats.ttest_rel(g1_upstream, g1_downstream)
+        if pval_within_g1 < 0.001:
+            ptext_g1 = "p<0.001 ***"
+        elif pval_within_g1 < 0.01:
+            ptext_g1 = "p<0.01 **"
+        elif pval_within_g1 < 0.05:
+            ptext_g1 = f"p={pval_within_g1:.3f} *"
+        else:
+            ptext_g1 = f"p={pval_within_g1:.3f}"
+            
+        # Add horizontal line and p-value between upstream and downstream for first genotype
+        line_height_g1 = 1.08
+        ax.plot([1, 2], [line_height_g1, line_height_g1], 'k-', lw=1)
+        ax.text(1.5, line_height_g1 + 0.02, ptext_g1, ha='center', va='bottom', fontsize=9)
+
+        # For second genotype (compare positions 3.5 and 4.5)
+        tstat_within_g2, pval_within_g2 = stats.ttest_rel(g2_upstream, g2_downstream)
+        if pval_within_g2 < 0.001:
+            ptext_g2 = "p<0.001 ***"
+        elif pval_within_g2 < 0.01:
+            ptext_g2 = "p<0.01 **"
+        elif pval_within_g2 < 0.05:
+            ptext_g2 = f"p={pval_within_g2:.3f} *"
+        else:
+            ptext_g2 = f"p={pval_within_g2:.3f}"
+            
+        # Add horizontal line and p-value between upstream and downstream for second genotype
+        line_height_g2 = 1.08
+        ax.plot([3.5, 4.5], [line_height_g2, line_height_g2], 'k-', lw=1)
+        ax.text(4.0, line_height_g2 + 0.02, ptext_g2, ha='center', va='bottom', fontsize=9)
+
+        # Update stat_results_txt with within-genotype comparisons
+        stat_results_txt.append(f"  Within-genotype comparisons (upstream vs downstream):")
+        stat_results_txt.append(f"    {labels[0]}: t={tstat_within_g1:.4f}, p={pval_within_g1:.4f} {'(significant)' if pval_within_g1 < 0.05 else '(not significant)'}")
+        stat_results_txt.append(f"    {labels[1]}: t={tstat_within_g2:.4f}, p={pval_within_g2:.4f} {'(significant)' if pval_within_g2 < 0.05 else '(not significant)'}")
+        
+        # Configure the plot
+        ax.set_ylim(0, 1.25)  # Higher upper limit to accommodate annotations
+        ax.set_ylabel('Probability of Cast Direction')
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels_box, rotation=45, ha='right')
+        ax.set_title(f'{cast_type.capitalize()} Casts')
+    
+    # Add overall title
+    fig.suptitle(f'Comparison of Cast Directions When Perpendicular to Flow (±{angle_width}°)', fontsize=14)
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.85, bottom=0.20)  # More space at bottom for labels
+    
+    # Save figure if basepath is provided
+    if basepath is not None:
+        figname = f"{basepath}/cast_direction_comparison_{label1_safe}_vs_{label2_safe}_{timestamp}.png"
+        plt.savefig(figname, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to: {figname}")
+        
+        # Also save as SVG for publication-quality figure
+        svgname = f"{basepath}/cast_direction_comparison_{label1_safe}_vs_{label2_safe}_{timestamp}.svg"
+        plt.savefig(svgname, format='svg', bbox_inches='tight')
+        print(f"Saved SVG to: {svgname}")
+    
+    plt.show()
+    
+    # Generate per-larva stacked bar plot for each genotype
+    for genotype_name, results in [(labels[0], genotype1_results), (labels[1], genotype2_results)]:
+        # Only create plots for cast types with data
+        for cast_type in cast_types:
+            n_larvae_with_data = len(results['per_larva_counts'][cast_type]['larva_ids'])
+            
+            if n_larvae_with_data > 0:
+                # Calculate downstream probability for each larva and sort
+                larva_data = []
+                for j in range(n_larvae_with_data):
+                    up = results['per_larva_counts'][cast_type]['upstream'][j]
+                    down = results['per_larva_counts'][cast_type]['downstream'][j]
+                    total = results['per_larva_counts'][cast_type]['total'][j]
+                    down_prob = down / total
+                    
+                    larva_data.append({
+                        'id': results['per_larva_counts'][cast_type]['larva_ids'][j],
+                        'upstream': up,
+                        'downstream': down,
+                        'total': total,
+                        'downstream_prob': down_prob
+                    })
+                
+                # Sort by downstream probability (ascending)
+                sorted_larvae = sorted(larva_data, key=lambda x: x['downstream_prob'])
+                
+                # Create per-larva bar chart
+                plt.figure(figsize=(8, max(5, n_larvae_with_data * 0.3)))
+                
+                # Create normalized stacked bar chart
+                larva_ids = [larva['id'] for larva in sorted_larvae]
+                upstream_normalized = [larva['upstream']/larva['total'] for larva in sorted_larvae]
+                downstream_normalized = [larva['downstream']/larva['total'] for larva in sorted_larvae]
+                
+                # Create positions
+                y_pos = np.arange(len(larva_ids))
+                
+                # Create normalized stacked bar chart
+                plt.barh(y_pos, upstream_normalized, 
+                        color=genotype_colors[genotype_name]['upstream'], 
+                        alpha=0.7, label='Upstream')
+                plt.barh(y_pos, downstream_normalized, 
+                        left=upstream_normalized, 
+                        color=genotype_colors[genotype_name]['downstream'], 
+                        alpha=0.7, label='Downstream')
+                
+                # Add downstream probability as text
+                for j, larva in enumerate(sorted_larvae):
+                    plt.text(1.02, j, f"{larva['downstream_prob']*100:.0f}%", va='center', fontsize=8)
+                    
+                    # Add total count at the start of each bar
+                    plt.text(-0.05, j, f"{larva['total']}", va='center', ha='right', fontsize=8)
+                
+                # Mark 50% line
+                plt.axvline(x=0.5, color='black', linestyle='--', alpha=0.3)
+                
+                # Format plot
+                plt.yticks(y_pos, larva_ids)
+                plt.xlim(0, 1.15)  # Make room for percentage labels
+                plt.xlabel('Proportion of Casts')
+                plt.ylabel('Larva ID')
+                plt.title(f'{genotype_name} - {cast_type.capitalize()} Cast Direction Breakdown\n' + 
+                         f'(n={n_larvae_with_data} larvae, {sum(larva["total"] for larva in sorted_larvae)} casts)')
+                plt.legend(loc='upper center', bbox_to_anchor=(0.5, 1.1), ncol=2)
+                plt.tight_layout()
+                
+                # Save figure if basepath is provided
+                if basepath is not None:
+                    safe_name = ''.join(c if c.isalnum() else '_' for c in genotype_name)
+                    figname = f"{basepath}/cast_directions_per_larva_{safe_name}_{cast_type}_{timestamp}.png"
+                    plt.savefig(figname, dpi=300, bbox_inches='tight')
+                
+                plt.show()
+    
+    # Save statistical results to text file
+    if basepath is not None:
+        txtname = f"{basepath}/cast_direction_stats_{label1_safe}_vs_{label2_safe}_{timestamp}.txt"
+        with open(txtname, 'w') as f:
+            f.write('\n'.join(stat_results_txt))
+        print(f"Saved statistics to: {txtname}")
+    
+    # Return combined results
+    return {
+        'cast_direction_comparison': {
+            'genotype1': genotype1_results,
+            'genotype2': genotype2_results
+        },
+        'statistical_tests': comparison_results['statistical_tests'],
+        'angle_width': angle_width,
+        'smooth_window': smooth_window,
+        'jump_threshold': jump_threshold
+    }
+
+
+
+
+
+
+
+def compare_cast_amplitudes_by_direction(genotype1_data, genotype2_data, labels=None, angle_width=5, 
+                                        smooth_window=5, jump_threshold=15, basepath=None):
+    """
+    Compare bend amplitudes between upstream and downstream casts for two genotypes when larvae are perpendicular to flow.
+    Uses sophisticated peak detection to classify casts and measure their amplitudes.
+    
+    Parameters:
+    -----------
+    genotype1_data : dict
+        Tracking data dictionary for first genotype
+    genotype2_data : dict
+        Tracking data dictionary for second genotype
+    labels : tuple, optional
+        Tuple of (label1, label2) for the genotypes
+    angle_width : int
+        Width of perpendicular orientation sector in degrees
+    smooth_window : int
+        Window size for smoothing (default=5)
+    jump_threshold : float
+        Threshold for detecting orientation jumps in degrees/frame (default=15)
+    basepath : str, optional
+        Base path for saving output files
+        
+    Returns:
+    --------
+    dict: Contains comparison statistics and test results
+    """
+    from scipy import stats
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import find_peaks
+    from datetime import datetime
+    from matplotlib.patches import Patch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
+    # Set default labels if not provided
+    if labels is None:
+        labels = ('Genotype 1', 'Genotype 2')
+    
+    # Create safe filenames from labels
+    label1_safe = ''.join(c if c.isalnum() else '_' for c in labels[0])
+    label2_safe = ''.join(c if c.isalnum() else '_' for c in labels[1])
+    
+    # Create timestamp for file names
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Make sure basepath exists
+    if basepath is not None:
+        import os
+        os.makedirs(basepath, exist_ok=True)
+    
+    # Define perpendicular angle ranges (both left and right sides)
+    # With wind blowing towards negative x, perpendicular is ±90°
+    left_perp_range = (-90 - angle_width, -90 + angle_width)
+    right_perp_range = (90 - angle_width, 90 + angle_width)
+    
+    def is_perpendicular(angle):
+        """Check if an angle is within the perpendicular ranges"""
+        return ((left_perp_range[0] <= angle <= left_perp_range[1]) or 
+                (right_perp_range[0] <= angle <= right_perp_range[1]))
+    
+    def analyze_peaks_in_genotype(genotype_data):
+        """Analyze cast peaks and store bend amplitudes within a genotype"""
+        # Store bend amplitudes for each cast type and direction
+        cast_amplitudes = {
+            'small': {'upstream': [], 'downstream': [], 'larva_ids': []},
+            'large': {'upstream': [], 'downstream': [], 'larva_ids': []},
+            'all': {'upstream': [], 'downstream': [], 'larva_ids': []}
+        }
+        
+        # Store per-larva amplitudes
+        per_larva_amplitudes = {
+            'small': {'upstream': [], 'downstream': [], 'larva_ids': []},
+            'large': {'upstream': [], 'downstream': [], 'larva_ids': []},
+            'all': {'upstream': [], 'downstream': [], 'larva_ids': []}
+        }
+        
+        # Store raw counts for analysis
+        total_counts = {
+            'small': {'upstream': 0, 'downstream': 0},
+            'large': {'upstream': 0, 'downstream': 0},
+            'all': {'upstream': 0, 'downstream': 0}
+        }
+        
+        # Determine which data structure we're working with
+        if 'data' in genotype_data:
+            data_to_process = genotype_data['data']
+            n_larvae = genotype_data['metadata']['total_larvae']
+        else:
+            data_to_process = genotype_data
+            n_larvae = len(data_to_process)
+        
+        # Process each larva
+        larvae_processed = 0
+        for larva_id, larva_data in data_to_process.items():
+            # Extract nested data if needed
+            if 'data' in larva_data:
+                larva_data = larva_data['data']
+                
+            # Extract required data
+            try:
+                # Extract basic time series data
+                time = np.array(larva_data['t']).flatten()
+                states = np.array(larva_data['global_state_large_state']).flatten()
+                
+                # Check for small_large_state or fall back to large_state
+                has_small_large_state = 'global_state_small_large_state' in larva_data
+                
+                if has_small_large_state:
+                    # Extract both small and large cast states
+                    small_large_states = np.array(larva_data['global_state_small_large_state']).flatten()
+                    large_cast_mask = small_large_states == 2.0  # Large casts = 2.0
+                    small_cast_mask = small_large_states == 1.5  # Small casts = 1.5
+                else:
+                    # Fall back to just large state if small_large_state isn't available
+                    large_cast_mask = states == 2  # Only large casts available
+                    small_cast_mask = np.zeros_like(states, dtype=bool)  # No small casts
+                
+                any_cast_mask = large_cast_mask | small_cast_mask
+                
+                # Get orientation angles
+                x_center = np.array(larva_data['x_center']).flatten()
+                y_center = np.array(larva_data['y_center']).flatten()
+                x_spine = np.array(larva_data['x_spine'])
+                y_spine = np.array(larva_data['y_spine'])
+                
+                if x_spine.ndim > 1:
+                    x_tail = x_spine[-1].flatten()
+                    y_tail = y_spine[-1].flatten()
+                else:
+                    x_tail = x_spine
+                    y_tail = y_spine
+                
+                # Calculate orientation vectors
+                dx = x_center - x_tail
+                dy = y_center - y_tail
+                orientation_angles = np.degrees(np.arctan2(dy, -dx))  # -dx because 0° is negative x-axis
+                
+                # Get upper-lower bend angle
+                angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
+                angle_upper_lower_deg = np.degrees(angle_upper_lower)
+                
+                # Ensure all arrays have the same length
+                min_length = min(len(time), len(orientation_angles), len(angle_upper_lower_deg), len(states))
+                time = time[:min_length]
+                orientation_angles = orientation_angles[:min_length]
+                angle_upper_lower_deg = angle_upper_lower_deg[:min_length]
+                states = states[:min_length]
+                large_cast_mask = large_cast_mask[:min_length]
+                small_cast_mask = small_cast_mask[:min_length]
+                any_cast_mask = any_cast_mask[:min_length]
+                
+                # ==== FILTERING AND PROCESSING ====
+                
+                # 1. Orientation angle jump detection and correction
+                orientation_raw = orientation_angles.copy()
+                
+                # Calculate derivative to detect jumps
+                orientation_diff = np.abs(np.diff(orientation_angles))
+                # Add zero at the beginning to match length
+                orientation_diff = np.insert(orientation_diff, 0, 0)
+                
+                # Find jumps bigger than threshold
+                jumps = orientation_diff > jump_threshold
+                
+                # Create masked array for plotting
+                orientation_masked = np.ma.array(orientation_angles, mask=jumps)
+                
+                # Apply Gaussian smoothing to the filtered data
+                # First interpolate masked values for smoothing
+                orientation_interp = orientation_masked.filled(np.nan)
+                mask = np.isnan(orientation_interp)
+                
+                # Only interpolate if we have valid data
+                if np.sum(~mask) > 1:
+                    indices = np.arange(len(orientation_interp))
+                    valid_indices = indices[~mask]
+                    valid_values = orientation_interp[~mask]
+                    orientation_interp[mask] = np.interp(indices[mask], valid_indices, valid_values)
+                
+                # Apply smoothing
+                orientation_smooth = gaussian_filter1d(orientation_interp, smooth_window/3.0)
+                
+                # 2. Intelligent peak detection for bend angle
+                # Calculate slope changes
+                bend_angle_diff = np.diff(angle_upper_lower_deg)
+                # Add zero at the beginning to match length
+                bend_angle_diff = np.insert(bend_angle_diff, 0, 0)
+                
+                # Smooth the bend angle
+                bend_angle_smooth = gaussian_filter1d(angle_upper_lower_deg, smooth_window/3.0)
+                
+                # Find peaks with intelligent filtering:
+                pos_peaks, _ = find_peaks(
+                    bend_angle_smooth, 
+                    height=5,        
+                    prominence=3,        
+                    distance=5
+                )
+                
+                neg_peaks, _ = find_peaks(
+                    -bend_angle_smooth, 
+                    height=5,        
+                    prominence=3,        
+                    distance=5
+                )
+                
+                # Combine positive and negative peaks
+                all_peaks = np.union1d(pos_peaks, neg_peaks)
+                
+                # Filter out peaks that start from flat regions
+                slope_threshold = 0.5  # Define what's considered "flat"
+                filtered_peaks = []
+                for peak in all_peaks:
+                    if peak > 0 and abs(bend_angle_diff[peak-1]) > slope_threshold:
+                        filtered_peaks.append(peak)
+                
+                # Storage for cast amplitudes by type and direction
+                larva_amplitudes = {
+                    'large': {'upstream': [], 'downstream': []},
+                    'small': {'upstream': [], 'downstream': []},
+                    'all': {'upstream': [], 'downstream': []}
+                }
+                
+                # Process each peak to classify as upstream or downstream and store amplitude
+                for peak in filtered_peaks:
+                    # Only consider peaks during cast behaviors that are perpendicular to flow
+                    is_large_cast = large_cast_mask[peak]
+                    is_small_cast = small_cast_mask[peak]
+                    is_any_cast = any_cast_mask[peak]
+                    is_perp = is_perpendicular(orientation_smooth[peak])
+                    
+                    if is_perp:  # Only analyze peaks when orientation is perpendicular
+                        # Get orientation at time of peak (after smoothing)
+                        orientation = orientation_smooth[peak]
+                        bend_angle = bend_angle_smooth[peak]
+                        
+                        # Normalize orientation to -180 to 180 range
+                        while orientation > 180:
+                            orientation -= 360
+                        while orientation <= -180:
+                            orientation += 360
+                        
+                        # Classify as upstream or downstream based on orientation and bend direction
+                        is_upstream = False
+                        if (orientation > 0 and orientation < 180):  # Right side
+                            if bend_angle < 0:  # Negative bend is upstream
+                                is_upstream = True
+                            else:  # Positive bend is downstream
+                                is_upstream = False
+                        else:  # Left side
+                            if bend_angle > 0:  # Positive bend is upstream
+                                is_upstream = True
+                            else:  # Negative bend is downstream
+                                is_upstream = False
+                        
+                        # Store the absolute amplitude of the bend
+                        cast_direction = 'upstream' if is_upstream else 'downstream'
+                        amplitude = abs(bend_angle)  # Absolute value of bend angle
+                        
+                        if is_large_cast:
+                            larva_amplitudes['large'][cast_direction].append(amplitude)
+                        if is_small_cast:
+                            larva_amplitudes['small'][cast_direction].append(amplitude)
+                        if is_any_cast:
+                            larva_amplitudes['all'][cast_direction].append(amplitude)
+                
+                # Only include larvae with sufficient cast data
+                has_casts = False
+                for cast_type in ['large', 'small', 'all']:
+                    upstream_amps = larva_amplitudes[cast_type]['upstream']
+                    downstream_amps = larva_amplitudes[cast_type]['downstream']
+                    
+                    # Require at least 3 casts in each direction for reliable analysis
+                    if len(upstream_amps) >= 3 and len(downstream_amps) >= 3:
+                        has_casts = True
+                        
+                        # Add to total counts
+                        total_counts[cast_type]['upstream'] += len(upstream_amps)
+                        total_counts[cast_type]['downstream'] += len(downstream_amps)
+                        
+                        # Add to overall amplitude lists
+                        cast_amplitudes[cast_type]['upstream'].extend(upstream_amps)
+                        cast_amplitudes[cast_type]['downstream'].extend(downstream_amps)
+                        
+                        # For tracking which larva contributed to each amplitude
+                        cast_amplitudes[cast_type]['larva_ids'].extend([str(larva_id)] * (len(upstream_amps) + len(downstream_amps)))
+                        
+                        # Store per-larva amplitude lists for paired analysis
+                        per_larva_amplitudes[cast_type]['upstream'].append(upstream_amps)
+                        per_larva_amplitudes[cast_type]['downstream'].append(downstream_amps)
+                        per_larva_amplitudes[cast_type]['larva_ids'].append(str(larva_id))
+                
+                if has_casts:
+                    larvae_processed += 1
+                
+            except Exception as e:
+                print(f"Error processing larva {larva_id}: {e}")
+        
+        # Calculate summary statistics for bend amplitudes
+        amplitude_stats = {}
+        for cast_type in ['small', 'large', 'all']:
+            upstream_amps = np.array(cast_amplitudes[cast_type]['upstream'])
+            downstream_amps = np.array(cast_amplitudes[cast_type]['downstream'])
+            
+            if len(upstream_amps) > 0 and len(downstream_amps) > 0:
+                # Calculate means and SEMs
+                amplitude_stats[cast_type] = {
+                    'upstream': {
+                        'mean': np.mean(upstream_amps),
+                        'sem': stats.sem(upstream_amps) if len(upstream_amps) > 1 else 0,
+                        'n': len(upstream_amps)
+                    },
+                    'downstream': {
+                        'mean': np.mean(downstream_amps),
+                        'sem': stats.sem(downstream_amps) if len(downstream_amps) > 1 else 0,
+                        'n': len(downstream_amps)
+                    }
+                }
+                
+                # Perform statistical tests
+                # Independent t-test (unpaired) for all amplitudes
+                tstat, pval = stats.ttest_ind(upstream_amps, downstream_amps, equal_var=False)
+                amplitude_stats[cast_type]['ttest_ind'] = {
+                    'tstat': tstat,
+                    'pval': pval
+                }
+                
+                # Calculate mean amplitudes per larva for paired tests
+                larvae_mean_upstream = []
+                larvae_mean_downstream = []
+                
+                for ups, downs in zip(per_larva_amplitudes[cast_type]['upstream'], 
+                                     per_larva_amplitudes[cast_type]['downstream']):
+                    if len(ups) > 0 and len(downs) > 0:
+                        larvae_mean_upstream.append(np.mean(ups))
+                        larvae_mean_downstream.append(np.mean(downs))
+                
+                # Paired t-test if we have per-larva data
+                if len(larvae_mean_upstream) > 1:
+                    tstat_paired, pval_paired = stats.ttest_rel(larvae_mean_upstream, larvae_mean_downstream)
+                    amplitude_stats[cast_type]['ttest_paired'] = {
+                        'tstat': tstat_paired,
+                        'pval': pval_paired,
+                        'n_larvae': len(larvae_mean_upstream)
+                    }
+            else:
+                amplitude_stats[cast_type] = None
+        
+        return {
+            'cast_amplitudes': cast_amplitudes,
+            'per_larva_amplitudes': per_larva_amplitudes,
+            'amplitude_stats': amplitude_stats,
+            'total_counts': total_counts,
+            'larvae_processed': larvae_processed,
+            'total_larvae': n_larvae
+        }
+    
+    # Analyze both genotypes separately
+    print(f"Analyzing {labels[0]}...")
+    genotype1_results = analyze_peaks_in_genotype(genotype1_data)
+    
+    print(f"Analyzing {labels[1]}...")
+    genotype2_results = analyze_peaks_in_genotype(genotype2_data)
+    
+    # Store comparison results
+    comparison_results = {
+        'angle_width': angle_width,
+        'labels': labels,
+        'statistical_tests': {}
+    }
+    
+    # Cast types to analyze
+    cast_types = ['all', 'large', 'small']
+    
+    # Colors for each condition
+    condition_colors = {
+        'upstream': {
+            labels[0]: '#1f77b4',  # Blue
+            labels[1]: '#d62728'   # Red
+        },
+        'downstream': {
+            labels[0]: '#9ecae1',  # Light blue
+            labels[1]: '#ff9896'   # Light red
+        }
+    }
+    
+    # Count valid cast types (those with data in both genotypes)
+    valid_cast_types = []
+    for cast_type in cast_types:
+        g1_stats = genotype1_results['amplitude_stats'].get(cast_type)
+        g2_stats = genotype2_results['amplitude_stats'].get(cast_type)
+        
+        if g1_stats and g2_stats:
+            valid_cast_types.append(cast_type)
+    
+    n_cast_types = len(valid_cast_types)
+    
+    if n_cast_types == 0:
+        print("No cast data found in both genotypes. Skipping plots.")
+        return comparison_results
+    
+    # Create figure for comparison
+    fig, axes = plt.subplots(1, n_cast_types, figsize=(5 * n_cast_types, 6))
+    
+    # Handle the case of a single subplot
+    if n_cast_types == 1:
+        axes = [axes]
+    
+    # Variable to store statistical results for text file
+    stat_results_txt = []
+    stat_results_txt.append(f"Cast Amplitude Comparison: {labels[0]} vs {labels[1]}")
+    stat_results_txt.append(f"Analysis timestamp: {timestamp}")
+    stat_results_txt.append(f"Perpendicular angle width: ±{angle_width}°")
+    stat_results_txt.append(f"Using improved peak detection with jump_threshold={jump_threshold} and smooth_window={smooth_window}")
+    stat_results_txt.append("\n")
+    
+    # Process each cast type
+    for ax_idx, cast_type in enumerate(valid_cast_types):
+        ax = axes[ax_idx]
+        
+        # Extract amplitude data
+        g1_upstream = np.array(genotype1_results['cast_amplitudes'][cast_type]['upstream'])
+        g1_downstream = np.array(genotype1_results['cast_amplitudes'][cast_type]['downstream'])
+        g2_upstream = np.array(genotype2_results['cast_amplitudes'][cast_type]['upstream'])
+        g2_downstream = np.array(genotype2_results['cast_amplitudes'][cast_type]['downstream'])
+        
+        # Data for box plot
+        data = [g1_upstream, g1_downstream, g2_upstream, g2_downstream]
+        positions = [1, 2, 4, 5]
+        labels_box = [f'{labels[0]}\nUpstream', f'{labels[0]}\nDownstream', 
+                     f'{labels[1]}\nUpstream', f'{labels[1]}\nDownstream']
+        
+        # Create box plot
+        bp = ax.boxplot(data, positions=positions, notch=True, patch_artist=True, 
+                       widths=0.6, showfliers=False)
+        
+        # Color boxes by condition
+        colors = [condition_colors['upstream'][labels[0]], 
+                 condition_colors['downstream'][labels[0]],
+                 condition_colors['upstream'][labels[1]], 
+                 condition_colors['downstream'][labels[1]]]
+        
+        for i, box in enumerate(bp['boxes']):
+            box.set(facecolor=colors[i], alpha=0.6)
+            bp['medians'][i].set(color='black', linewidth=1.5)
+        
+        # Add individual data points with jitter
+        for i, (pos, d) in enumerate(zip(positions, data)):
+            # Limit to max 100 points for clarity
+            if len(d) > 100:
+                # Stratified sampling to ensure representation of the distribution
+                indices = np.linspace(0, len(d)-1, 100, dtype=int)
+                d_sampled = d[indices]
+            else:
+                d_sampled = d
+                
+            jitter = 0.1 * np.random.randn(len(d_sampled))
+            ax.scatter(pos + jitter, d_sampled, s=25, alpha=0.5, color=colors[i], 
+                      edgecolor='k', linewidth=0.5)
+        
+        # Add annotations: mean ± SEM
+        for i, (pos, d) in enumerate(zip(positions, data)):
+            mean = np.mean(d)
+            sem = stats.sem(d) if len(d) > 1 else 0
+            ax.text(pos, np.max(d) + 5, f"{mean:.1f}±{sem:.1f}°", ha='center', 
+                   fontsize=9, bbox=dict(facecolor='white', alpha=0.7, pad=0.1))
+        
+        # Add count annotations
+        ax.text(1, -5, f"n={len(g1_upstream)}", ha='center', va='top', fontsize=8)
+        ax.text(2, -5, f"n={len(g1_downstream)}", ha='center', va='top', fontsize=8)
+        ax.text(4, -5, f"n={len(g2_upstream)}", ha='center', va='top', fontsize=8)
+        ax.text(5, -5, f"n={len(g2_downstream)}", ha='center', va='top', fontsize=8)
+        
+        # Add statistical tests for upstream vs downstream within genotypes
+        # For first genotype
+        g1_stats = genotype1_results['amplitude_stats'][cast_type]
+        g1_pval = g1_stats['ttest_ind']['pval']
+        
+        if g1_pval < 0.001:
+            g1_ptext = "p<0.001 ***"
+        elif g1_pval < 0.01:
+            g1_ptext = "p<0.01 **"
+        elif g1_pval < 0.05:
+            g1_ptext = f"p={g1_pval:.3f} *"
+        else:
+            g1_ptext = f"p={g1_pval:.3f}"
+            
+        # Add line and p-value for first genotype
+        g1_maxheight = max(np.max(g1_upstream), np.max(g1_downstream)) + 10
+        ax.plot([1, 2], [g1_maxheight, g1_maxheight], 'k-', lw=1)
+        ax.text(1.5, g1_maxheight + 2, g1_ptext, ha='center', va='bottom', fontsize=9)
+        
+        # For second genotype
+        g2_stats = genotype2_results['amplitude_stats'][cast_type]
+        g2_pval = g2_stats['ttest_ind']['pval']
+        
+        if g2_pval < 0.001:
+            g2_ptext = "p<0.001 ***"
+        elif g2_pval < 0.01:
+            g2_ptext = "p<0.01 **"
+        elif g2_pval < 0.05:
+            g2_ptext = f"p={g2_pval:.3f} *"
+        else:
+            g2_ptext = f"p={g2_pval:.3f}"
+            
+        # Add line and p-value for second genotype
+        g2_maxheight = max(np.max(g2_upstream), np.max(g2_downstream)) + 10
+        ax.plot([4, 5], [g2_maxheight, g2_maxheight], 'k-', lw=1)
+        ax.text(4.5, g2_maxheight + 2, g2_ptext, ha='center', va='bottom', fontsize=9)
+        
+        # Add comparison between genotypes for upstream and downstream
+        # Upstream comparison (g1_upstream vs g2_upstream)
+        tstat_up, pval_up = stats.ttest_ind(g1_upstream, g2_upstream, equal_var=False)
+        comparison_results['statistical_tests'][f'{cast_type}_upstream'] = {
+            'tstat': tstat_up, 
+            'pval': pval_up
+        }
+        
+        if pval_up < 0.001:
+            up_ptext = "p<0.001 ***"
+        elif pval_up < 0.01:
+            up_ptext = "p<0.01 **"
+        elif pval_up < 0.05:
+            up_ptext = f"p={pval_up:.3f} *"
+        else:
+            up_ptext = f"p={pval_up:.3f}"
+            
+        # Add line for upstream comparison
+        up_maxheight = max(np.max(g1_upstream), np.max(g2_upstream)) + 15
+        ax.plot([1, 4], [up_maxheight, up_maxheight], 'k-', lw=1)
+        ax.text(2.5, up_maxheight + 2, up_ptext, ha='center', va='bottom', fontsize=9)
+        
+        # Downstream comparison (g1_downstream vs g2_downstream)
+        tstat_down, pval_down = stats.ttest_ind(g1_downstream, g2_downstream, equal_var=False)
+        comparison_results['statistical_tests'][f'{cast_type}_downstream'] = {
+            'tstat': tstat_down, 
+            'pval': pval_down
+        }
+        
+        if pval_down < 0.001:
+            down_ptext = "p<0.001 ***"
+        elif pval_down < 0.01:
+            down_ptext = "p<0.01 **"
+        elif pval_down < 0.05:
+            down_ptext = f"p={pval_down:.3f} *"
+        else:
+            down_ptext = f"p={pval_down:.3f}"
+            
+        # Add line for downstream comparison
+        down_maxheight = max(np.max(g1_downstream), np.max(g2_downstream)) + 20
+        ax.plot([2, 5], [down_maxheight, down_maxheight], 'k-', lw=1, linestyle='--')
+        ax.text(3.5, down_maxheight + 2, down_ptext, ha='center', va='bottom', fontsize=9)
+        
+        # Configure the plot
+        max_y = max(
+            np.max(g1_upstream), np.max(g1_downstream),
+            np.max(g2_upstream), np.max(g2_downstream)
+        ) + 30  # More room for annotations
+        
+        ax.set_ylim(0, max_y)
+        ax.set_ylabel('Bend Amplitude (degrees)')
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels_box, rotation=45, ha='right')
+        ax.set_title(f'{cast_type.capitalize()} Casts')
+        
+        # Add statistical test results to text output
+        stat_results_txt.append(f"\n{cast_type.capitalize()} Casts - Bend Amplitude Comparison:")
+        
+        # Within-genotype comparisons (upstream vs downstream)
+        stat_results_txt.append(f"  Within-genotype comparisons (upstream vs downstream):")
+        stat_results_txt.append(f"    {labels[0]} upstream: {g1_stats['upstream']['mean']:.2f}° ± {g1_stats['upstream']['sem']:.2f}° (n={g1_stats['upstream']['n']})")
+        stat_results_txt.append(f"    {labels[0]} downstream: {g1_stats['downstream']['mean']:.2f}° ± {g1_stats['downstream']['sem']:.2f}° (n={g1_stats['downstream']['n']})")
+        stat_results_txt.append(f"    {labels[0]} comparison: t={g1_stats['ttest_ind']['tstat']:.3f}, p={g1_stats['ttest_ind']['pval']:.4f} {'(significant)' if g1_stats['ttest_ind']['pval'] < 0.05 else ''}")
+        
+        stat_results_txt.append(f"    {labels[1]} upstream: {g2_stats['upstream']['mean']:.2f}° ± {g2_stats['upstream']['sem']:.2f}° (n={g2_stats['upstream']['n']})")
+        stat_results_txt.append(f"    {labels[1]} downstream: {g2_stats['downstream']['mean']:.2f}° ± {g2_stats['downstream']['sem']:.2f}° (n={g2_stats['downstream']['n']})")
+        stat_results_txt.append(f"    {labels[1]} comparison: t={g2_stats['ttest_ind']['tstat']:.3f}, p={g2_stats['ttest_ind']['pval']:.4f} {'(significant)' if g2_stats['ttest_ind']['pval'] < 0.05 else ''}")
+        
+        # Between-genotype comparisons
+        stat_results_txt.append(f"  Between-genotype comparisons:")
+        stat_results_txt.append(f"    Upstream ({labels[0]} vs {labels[1]}): t={tstat_up:.3f}, p={pval_up:.4f} {'(significant)' if pval_up < 0.05 else ''}")
+        stat_results_txt.append(f"    Downstream ({labels[0]} vs {labels[1]}): t={tstat_down:.3f}, p={pval_down:.4f} {'(significant)' if pval_down < 0.05 else ''}")
+    
+    # Add overall title
+    fig.suptitle(f'Comparison of Cast Bend Amplitudes When Perpendicular to Flow (±{angle_width}°)', fontsize=14)
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.85, bottom=0.20)  # More space at bottom for labels
+    
+    # Save figure if basepath is provided
+    if basepath is not None:
+        figname = f"{basepath}/cast_amplitude_comparison_{label1_safe}_vs_{label2_safe}_{timestamp}.png"
+        plt.savefig(figname, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to: {figname}")
+        
+        # Also save as SVG for publication-quality figure
+        svgname = f"{basepath}/cast_amplitude_comparison_{label1_safe}_vs_{label2_safe}_{timestamp}.svg"
+        plt.savefig(svgname, format='svg', bbox_inches='tight')
+        print(f"Saved SVG to: {svgname}")
+        
+        # Save statistical results to text file
+        txtname = f"{basepath}/cast_amplitude_stats_{label1_safe}_vs_{label2_safe}_{timestamp}.txt"
+        with open(txtname, 'w') as f:
+            f.write('\n'.join(stat_results_txt))
+        print(f"Saved statistics to: {txtname}")
+    
+    plt.show()
+    
+    # Return results
+    return {
+        'genotype1': genotype1_results,
+        'genotype2': genotype2_results,
+        'statistical_tests': comparison_results['statistical_tests'],
+        'analysis_parameters': {
+            'angle_width': angle_width,
+            'smooth_window': smooth_window,
+            'jump_threshold': jump_threshold
+        }
     }
