@@ -6,8 +6,6 @@ import numpy as np
 from tqdm.notebook import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-
-from scipy.stats import gaussian_kde
 plt.style.use('../anemotaxis.mplstyle')
 
 def get_behavior_data(f, field, i):
@@ -9887,12 +9885,6 @@ def compare_cast_directions_peaks(genotype1_data, genotype2_data, labels=None, a
         'smooth_window': smooth_window,
         'jump_threshold': jump_threshold
     }
-
-
-
-
-
-
 
 def compare_cast_amplitudes_by_direction(genotype1_data, genotype2_data, labels=None, angle_width=5, 
                                         smooth_window=5, jump_threshold=15, basepath=None):
