@@ -9,7 +9,7 @@ def get_behavior_data(f, field, i):
     """Extract behavior-related cell arrays from MATLAB struct.
     
     Args:
-        f: HDF5 file object
+        f: HDF5 file object (.mat file in our case for trx data)
         field: Field name (e.g., 'duration_large', 't_start_stop_large', 'duration_large_small')
         i: Larva index
         
@@ -22,7 +22,7 @@ def get_behavior_data(f, field, i):
         if not isinstance(cell_ref, h5py.h5r.Reference):
             return None
             
-        # Get the 1xN cell array (either 1x7 or 1x12)
+        # Get the 1xN cell array (usually, either 1x7 or 1x12)
         cell_array = f[cell_ref]
         
         # Determine if this is a large_small field (has 12 elements) or regular field (7 elements)
@@ -274,3 +274,13 @@ def filter_larvae_by_duration(data, min_total_duration=None, percentile=10):
         }
     else:
         return filtered_data
+    
+def filter_by_behavior_type(data, behavior_type, min_count=1):
+    """Filter larvae that have at least min_count instances of a behavior."""
+    # Implementation here...
+    pass
+
+def filter_by_experiment_date(data, start_date, end_date):
+    """Filter data by experiment date range."""
+    # Implementation here...
+    pass
