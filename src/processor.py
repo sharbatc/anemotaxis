@@ -2730,6 +2730,137 @@ def analyze_run_orientations_single(trx_data):
         'n_small_runs': len(small_run_orientations),
         'n_total_runs': len(all_run_orientations)
     }
+def compute_orientation_tail_to_neck(x_tail, y_tail, x_neck, y_neck):
+    """
+    Compute orientation angle between tail-to-neck vector and negative x-axis.
+    Returns angle in degrees, where 0° = facing -x (downstream), ±180° = +x (upstream).
+    """
+    v_x = x_neck - x_tail
+    v_y = y_neck - y_tail
+    angle_rad = np.arctan2(v_y, -v_x)  # -v_x for -x axis
+    angle_deg = np.degrees(angle_rad)
+    angle_deg = (angle_deg + 180) % 360 - 180
+    return angle_deg
+def analyze_turn_rate_by_orientation_true(
+    trx_data, bin_width=10, show_plot=True, ax=None, sigma=2, min_turn_amplitude=10
+):
+    """
+    Analyze turn rate (turns/sec) vs orientation using tail-to-neck orientation.
+    A turn is defined as a cast (state==2 or state==1.5) that results in an orientation change >= min_turn_amplitude (deg).
+    The orientation at which the turn occurs is the *initial* orientation at cast onset.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from scipy.ndimage import gaussian_filter1d
+
+    def get_orientation_array(larva_data):
+        required_keys = ['x_tail', 'y_tail', 'x_neck', 'y_neck']
+        if all(k in larva_data for k in required_keys):
+            x_tail = np.array(larva_data['x_tail']).flatten()
+            y_tail = np.array(larva_data['y_tail']).flatten()
+            x_neck = np.array(larva_data['x_neck']).flatten()
+            y_neck = np.array(larva_data['y_neck']).flatten()
+            min_len = min(len(x_tail), len(y_tail), len(x_neck), len(y_neck))
+            return compute_orientation_tail_to_neck(
+                x_tail[:min_len], y_tail[:min_len], x_neck[:min_len], y_neck[:min_len]
+            )
+        return None
+
+    if ax is None and show_plot:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        created_fig = True
+    else:
+        created_fig = False
+
+    if isinstance(trx_data, dict) and 'data' in trx_data:
+        data_to_process = trx_data['data']
+    else:
+        data_to_process = trx_data
+
+    bins = np.arange(-180, 181, bin_width)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+
+    turn_counts = np.zeros_like(bin_centers, dtype=float)
+    total_time = np.zeros_like(bin_centers, dtype=float)
+
+    for larva_id, larva_data in data_to_process.items():
+        try:
+            if 'global_state_large_state' not in larva_data or 't' not in larva_data:
+                continue
+            states = np.array(larva_data['global_state_large_state']).flatten()
+            t = np.array(larva_data['t']).flatten()
+            orientations = get_orientation_array(larva_data)
+            if orientations is None:
+                continue
+            min_len = min(len(states), len(t), len(orientations))
+            states = states[:min_len]
+            t = t[:min_len]
+            orientations = orientations[:min_len]
+
+            # Find all cast (state==2 or state==1.5) segments
+            i = 0
+            while i < len(states):
+                if states[i] == 2 or states[i] == 1.5:
+                    cast_start = i
+                    while i < len(states) and (states[i] == 2 or states[i] == 1.5):
+                        i += 1
+                    cast_end = i - 1
+                    # Only consider casts with at least 2 frames
+                    if cast_end > cast_start:
+                        orient_start = orientations[cast_start]
+                        orient_end = orientations[cast_end]
+                        # Compute orientation change (handle wraparound)
+                        delta = np.angle(np.exp(1j * np.deg2rad(orient_end - orient_start)), deg=True)
+                        if np.abs(delta) >= min_turn_amplitude:
+                            # Bin by initial orientation
+                            for j in range(len(bin_centers)):
+                                if bins[j] <= orient_start < bins[j+1]:
+                                    turn_counts[j] += 1
+                                    break
+                else:
+                    i += 1
+
+            # Bin total time spent in each orientation (all frames)
+            for j in range(len(bin_centers)):
+                bin_mask = (orientations >= bins[j]) & (orientations < bins[j+1])
+                t_bin = t[bin_mask]
+                if len(t_bin) > 1:
+                    total_time[j] += np.sum(np.diff(t_bin))
+                elif len(t_bin) == 1 and len(t) > 1:
+                    dt = np.median(np.diff(t))
+                    total_time[j] += dt
+
+        except Exception as e:
+            print(f"Error processing larva {larva_id}: {str(e)}")
+
+    # Compute turn rate per second
+    turn_rate_per_sec = np.zeros_like(bin_centers, dtype=float)
+    for j in range(len(bin_centers)):
+        if total_time[j] > 0:
+            turn_rate_per_sec[j] = turn_counts[j] / total_time[j]
+
+    smoothed_rates = gaussian_filter1d(turn_rate_per_sec, sigma=sigma)
+
+    if ax is not None:
+        ax.plot(bin_centers, smoothed_rates, color='purple', linewidth=2)
+        ax.set_xlabel('Orientation (°)')
+        ax.set_ylabel('Turn Rate (turns/sec)')
+        ax.set_xlim(-180, 180)
+        ax.grid(True, alpha=0.3)
+        ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+        ax.axvline(x=180, color='black', linestyle='--', alpha=0.5)
+        ax.axvline(x=-180, color='black', linestyle='--', alpha=0.5)
+        if created_fig and show_plot:
+            plt.tight_layout()
+            plt.show()
+
+    return {
+        'bin_centers': bin_centers,
+        'turn_counts': turn_counts,
+        'total_time': total_time,
+        'turn_rate_per_sec': turn_rate_per_sec,
+        'smoothed_rates': smoothed_rates
+    }
 
 def analyze_run_orientations_all(experiments_data):
     """
@@ -3091,14 +3222,14 @@ def analyze_turn_rate_by_orientation_new(trx_data, larva_id=None, bin_width=10,
     def get_orientations_and_states(larva_data):
         """Extract orientations, bend angles, and turn states for large and small turns."""
         # Calculate orientation
-        x_center = np.array(larva_data['x_center']).flatten()
-        y_center = np.array(larva_data['y_center']).flatten()
+        x_center = np.array(larva_data['x_neck']).flatten()
+        y_center = np.array(larva_data['y_neck']).flatten()
         x_tail = np.array(larva_data['x_spine'])[-1].flatten()
         y_tail = np.array(larva_data['y_spine'])[-1].flatten()
         
         tail_to_center = np.column_stack([x_center - x_tail, y_center - y_tail])
         # Calculate orientations in degrees
-        orientations = np.degrees(np.arctan2(tail_to_center[:, 1], tail_to_center[:, 0]))
+        orientations = np.degrees(np.arctan2(tail_to_center[:, 1], -tail_to_center[:, 0]))
         
         # Get upper-lower bend angle
         if 'angle_upper_lower_smooth_5' in larva_data:
@@ -3738,7 +3869,7 @@ def analyze_lateral_turn_rates(trx_data, angle_width=15, bin_width=5):
             
             # Calculate tail-to-center vectors
             tail_to_center = np.column_stack([x_center - x_tail, y_center - y_tail])
-            orientations = np.degrees(np.arctan2(tail_to_center[:, 1], tail_to_center[:, 0]))
+            orientations = np.degrees(np.arctan2(tail_to_center[:, 1], -tail_to_center[:, 0]))
             
             # Get casting states
             states = np.array(larva_data['global_state_large_state']).flatten()
@@ -7412,7 +7543,7 @@ def analyze_cast_orientations_single(trx_data):
             # Calculate orientations in degrees
             orientations = np.degrees(np.arctan2(
                 tail_to_center[:, 1],
-                tail_to_center[:, 0]
+                -tail_to_center[:, 0]
             ))
             
             # Add orientations to respective lists
@@ -7782,7 +7913,7 @@ def extract_cast_orientations(data, smooth_window=5, jump_threshold=15):
             # Calculate orientation vectors
             dx = x_center - x_tail
             dy = y_center - y_tail
-            orientation_angles = np.degrees(np.arctan2(dy, dx))  # -dx because 0° is negative x-axis
+            orientation_angles = np.degrees(np.arctan2(dy, -dx))  # -dx because 0° is negative x-axis
             
             # Get upper-lower bend angle
             angle_upper_lower = np.array(larva_data['angle_upper_lower_smooth_5']).flatten()
