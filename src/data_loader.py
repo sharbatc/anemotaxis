@@ -85,7 +85,7 @@ def process_single_file(file_path, show_progress=False):
                                  'head_velocity_norm_smooth_5', 'tail_velocity_norm_smooth_5',
                                  'motion_velocity_norm_smooth_5', 'angle_upper_lower_smooth_5',
                                  'angle_downer_upper_smooth_5', 'global_state_large_state',
-                                 'global_state_small_large_state','proba_global_state']:
+                                 'global_state_small_large_state','proba_global_state','larva_length_smooth_5']:
                         if field in f['trx']:
                             larva[field] = get_array(field)
                     

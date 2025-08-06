@@ -6,7 +6,25 @@ import numpy as np
 from tqdm.notebook import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from scipy.ndimage import gaussian_filter1d
 plt.style.use('../anemotaxis.mplstyle')
+
+def get_orientation_array(larva_data):
+    """
+    Always compute orientation as tail-to-neck relative to -x axis.
+    Returns None if required keys are missing.
+    """
+    required_keys = ['x_tail', 'y_tail', 'x_neck', 'y_neck']
+    if all(k in larva_data for k in required_keys):
+        x_tail = np.array(larva_data['x_tail']).flatten()
+        y_tail = np.array(larva_data['y_tail']).flatten()
+        x_neck = np.array(larva_data['x_neck']).flatten()
+        y_neck = np.array(larva_data['y_neck']).flatten()
+        min_len = min(len(x_tail), len(y_tail), len(x_neck), len(y_neck))
+        return compute_orientation_tail_to_neck(
+            x_tail[:min_len], y_tail[:min_len], x_neck[:min_len], y_neck[:min_len]
+        )
+    return None
 
 def filter_larvae_by_duration(data, min_total_duration=None, percentile=10):
     """Filter larvae based on their total tracked duration.
@@ -1448,7 +1466,7 @@ def plot_behavior_merge_differences(original_data, merged_data, larva_id=None, t
     return fig
 
 
-def plot_global_behavior_matrix(trx_data, show_separate_totals=True):
+def plot_global_behavior_matrix(trx_data, show_separate_totals=True, show_plot=True, ax=None):
     """
     Plot global behavior using the global state.
     
@@ -1459,32 +1477,23 @@ def plot_global_behavior_matrix(trx_data, show_separate_totals=True):
         trx_data: Dictionary of larva data
         show_separate_totals: If True, show large, small, and total behaviors as separate rows
                              If False, show only a single row per larva
+        show_plot: Whether to display the plot immediately
+        ax: Optional matplotlib axes to plot on
     
-    State mapping:
-    - 1, 0.5: run (large/small)
-    - 2, 1.5: cast (large/small)
-    - 3, 2.5: stop (large/small)
-    - 4, 3.5: hunch (large/small)
-    - 5, 4.5: backup (large/small)
-    - 6, 5.5: roll (large/small)
+    Returns:
+        Behavior matrix or dict of processed data depending on mode
     """
     import numpy as np
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
 
-    # Get sorted larva IDs
-    larva_ids = sorted(trx_data.keys())
-    n_larvae = len(larva_ids)
-    
-    # Compute time range
-    tmins = [np.min(trx_data[lid]['t']) for lid in larva_ids if len(trx_data[lid]['t']) > 0]
-    tmaxs = [np.max(trx_data[lid]['t']) for lid in larva_ids if len(trx_data[lid]['t']) > 0]
-    if not tmins or not tmaxs:
-        raise ValueError("No time data found!")
-    min_time = float(min(tmins))
-    max_time = float(max(tmaxs))
-    
-    resolution = 1000
+    # Create axis if none provided
+    if ax is None and show_plot:
+        fig, ax = plt.subplots(figsize=(12, 8))
+        created_fig = True
+    else:
+        created_fig = False
     
     # Define state value mapping (both integer and half-integer values)
     # Maps state values to behavior names and colors
@@ -1516,66 +1525,105 @@ def plot_global_behavior_matrix(trx_data, show_separate_totals=True):
         'roll': [0.6, 0.3, 0.6]       # Medium purple
     }
 
-    if show_separate_totals:
-        # Create 3 rows per larva: large, small, total
-        behavior_matrix = np.full((n_larvae * 3, resolution, 3), fill_value=1.0)  # white background
+    # Process larvae data
+    if isinstance(trx_data, dict) and 'data' in trx_data:
+        larvae_data = trx_data['data']
     else:
-        # Create 1 row per larva
-        behavior_matrix = np.full((n_larvae, resolution, 3), fill_value=1.0)  # white background
+        larvae_data = trx_data
+        
+    larva_ids = sorted(larvae_data.keys())
+    n_larvae = len(larva_ids)
+    
+    if n_larvae == 0:
+        ax.text(0.5, 0.5, "No larvae data available", 
+                ha='center', va='center', transform=ax.transAxes)
+        return {}
+    
+    # Compute time ranges
+    tmins = []
+    tmaxs = []
+    for lid in larva_ids:
+        if 't' in larvae_data[lid] and len(larvae_data[lid]['t']) > 0:
+            times = np.array(larvae_data[lid]['t']).flatten()
+            if len(times) > 0:
+                tmins.append(np.min(times))
+                tmaxs.append(np.max(times))
+    
+    if not tmins:
+        ax.text(0.5, 0.5, "No time data available", 
+                ha='center', va='center', transform=ax.transAxes)
+        return {}
+    
+    t_min = min(tmins)
+    t_max = max(tmaxs)
+    
+    # Decide on plotting approach based on show_separate_totals
+    if show_separate_totals:
+        # Create full behavior matrix with colors (as in original function)
+        resolution = 1000
+        behavior_matrix = np.full((n_larvae * 3, resolution, 3), fill_value=1.0)  # white background
+        
+        # Process each larva
+        for larva_idx, lid in enumerate(larva_ids):
+            # Get time and state data
+            if 't' not in larvae_data[lid] or len(larvae_data[lid]['t']) == 0:
+                continue  # Skip larvae without required data
+                
+            larva_time = np.array(larvae_data[lid]['t']).flatten()
+            
+            # Use global_state_small_large_state if available, otherwise use global_state_large_state
+            if 'global_state_small_large_state' in larvae_data[lid]:
+                states = np.array(larvae_data[lid]['global_state_small_large_state']).flatten()
+            elif 'global_state_large_state' in larvae_data[lid]:
+                states = np.array(larvae_data[lid]['global_state_large_state']).flatten()
+            else:
+                continue  # Skip if no state data available
+            
+            # Ensure arrays have same length
+            min_len = min(len(larva_time), len(states))
+            if min_len == 0:
+                continue
+                
+            larva_time = larva_time[:min_len]
+            states = states[:min_len]
+            
+            # Convert times to indices
+            time_indices = np.floor(
+                ((larva_time - t_min) / (t_max - t_min) * (resolution - 1))
+            ).astype(int)
+            time_indices = np.clip(time_indices, 0, resolution - 1)
 
-    # Process each larva
-    for larva_idx, lid in enumerate(larva_ids):
-        # Get time and state data
-        larva_time = np.array(trx_data[lid]['t']).flatten()
-        
-        # Use global_state_small_large_state if available, otherwise use global_state_large_state
-        if 'global_state_small_large_state' in trx_data[lid]:
-            states = np.array(trx_data[lid]['global_state_small_large_state']).flatten()
-        else:
-            states = np.array(trx_data[lid]['global_state_large_state']).flatten()
-        
-        # Convert times to indices
-        time_indices = np.floor(
-            ((larva_time - min_time) / (max_time - min_time) * (resolution - 1))
-        ).astype(int)
-        time_indices = np.clip(time_indices, 0, resolution - 1)
-
-        # Arrays to store large, small and total behaviors
-        large_behaviors = np.full((resolution, 3), fill_value=1.0)  # white background
-        small_behaviors = np.full((resolution, 3), fill_value=1.0)  # white background
-        total_behaviors = np.full((resolution, 3), fill_value=1.0)  # white background
-        
-        # For each unique time index, use the corresponding state
-        unique_indices = np.unique(time_indices)
-        for t_idx in unique_indices:
-            mask = time_indices == t_idx
-            if np.any(mask):
-                state_val = float(states[mask][0])  # Take first state if multiple exist
-                
-                # Round to nearest 0.5 to handle potential floating point issues
-                state_val = round(state_val * 2) / 2
-                
-                # Determine if this is a large or small behavior
-                is_large = state_val.is_integer()
-                is_small = not is_large
-                
-                # Assign colors based on state
-                if state_val in state_mapping:
-                    behavior_info = state_mapping[state_val]
+            # Arrays to store large, small and total behaviors
+            large_behaviors = np.full((resolution, 3), fill_value=1.0)  # white background
+            small_behaviors = np.full((resolution, 3), fill_value=1.0)  # white background
+            total_behaviors = np.full((resolution, 3), fill_value=1.0)  # white background
+            
+            # For each unique time index, use the corresponding state
+            unique_indices = np.unique(time_indices)
+            for t_idx in unique_indices:
+                mask = time_indices == t_idx
+                if np.any(mask):
+                    state_val = float(states[mask][0])  # Take first state if multiple exist
                     
-                    if is_large:
-                        large_behaviors[t_idx] = behavior_info['color']
-                        total_behaviors[t_idx] = total_behavior_colors[behavior_info['base']]
-                    elif is_small:
-                        small_behaviors[t_idx] = behavior_info['color']
-                        total_behaviors[t_idx] = total_behavior_colors[behavior_info['base']]
+                    # Round to nearest 0.5 to handle potential floating point issues
+                    state_val = round(state_val * 2) / 2
+                    
+                    # Determine if this is a large or small behavior
+                    is_large = state_val.is_integer()
+                    is_small = not is_large
+                    
+                    # Assign colors based on state
+                    if state_val in state_mapping:
+                        behavior_info = state_mapping[state_val]
                         
-                    # If not showing separate totals, just use the state color directly
-                    if not show_separate_totals:
-                        behavior_matrix[larva_idx, t_idx] = behavior_info['color']
-        
-        # If showing separate totals, assign the arrays to the behavior matrix
-        if show_separate_totals:
+                        if is_large:
+                            large_behaviors[t_idx] = behavior_info['color']
+                            total_behaviors[t_idx] = total_behavior_colors[behavior_info['base']]
+                        elif is_small:
+                            small_behaviors[t_idx] = behavior_info['color']
+                            total_behaviors[t_idx] = total_behavior_colors[behavior_info['base']]
+            
+            # Assign the arrays to the behavior matrix
             row_large = larva_idx * 3
             row_small = larva_idx * 3 + 1
             row_total = larva_idx * 3 + 2
@@ -1584,13 +1632,11 @@ def plot_global_behavior_matrix(trx_data, show_separate_totals=True):
             behavior_matrix[row_small] = small_behaviors
             behavior_matrix[row_total] = total_behaviors
 
-    # Create the plot
-    plt.figure(figsize=(8, min(6, n_larvae * (3 if show_separate_totals else 1) * 0.4)))
-    plt.imshow(behavior_matrix, aspect='auto', interpolation='nearest', alpha=0.8,
-               extent=[min_time, max_time, behavior_matrix.shape[0], 0])
-    
-    # Create y-tick labels
-    if show_separate_totals:
+        # Plot the behavior matrix
+        ax.imshow(behavior_matrix, aspect='auto', interpolation='nearest', alpha=0.8,
+                extent=[t_min, t_max, behavior_matrix.shape[0], 0])
+        
+        # Create y-tick labels
         ytick_positions = []
         ytick_labels = []
         
@@ -1599,63 +1645,135 @@ def plot_global_behavior_matrix(trx_data, show_separate_totals=True):
             # Position ticks in the middle of each row
             ytick_positions.extend([base_pos + 0.5, base_pos + 1.5, base_pos + 2.5])
             ytick_labels.extend([f"{lid} (large)", f"{lid} (small)", f"{lid} (total)"])
-    else:
-        ytick_positions = np.arange(0.5, n_larvae + 0.5)
-        ytick_labels = larva_ids
-    
-    plt.yticks(ytick_positions, ytick_labels, fontsize='small')
-    plt.title('Global Behavior States', pad=20)
-    plt.xlabel('Time (seconds)')
-    plt.ylabel('Larva ID')
-    
-    # Add horizontal lines to separate larvae if showing separate totals
-    if show_separate_totals:
+        
+        ax.set_yticks(ytick_positions)
+        ax.set_yticklabels(ytick_labels, fontsize='small')
+        
+        # Add horizontal lines to separate larvae
         for i in range(1, n_larvae):
             y_pos = i * 3
-            plt.axhline(y=y_pos, color='black', linestyle='-', linewidth=0.5)
-    
-    # Add legend with all states
-    legend_elements = []
-    
-    # Add large behaviors to legend
-    for state_val in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
-        if state_val in state_mapping:
-            info = state_mapping[state_val]
+            ax.axhline(y=y_pos, color='black', linestyle='-', linewidth=0.5)
+        
+        # Add legend with all states
+        legend_elements = []
+        
+        # Add large behaviors to legend
+        for state_val in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
+            if state_val in state_mapping:
+                info = state_mapping[state_val]
+                legend_elements.append(
+                    Patch(facecolor=info['color'], 
+                        label=f"{info['base']} (large)")
+                )
+        
+        # Add a separator in the legend
+        legend_elements.append(Patch(facecolor='white', label=''))
+        
+        # Add small behaviors to legend
+        for state_val in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]:
+            if state_val in state_mapping:
+                info = state_mapping[state_val]
+                legend_elements.append(
+                    Patch(facecolor=info['color'], 
+                        label=f"{info['base']} (small)")
+                )
+        
+        # Add a separator in the legend
+        legend_elements.append(Patch(facecolor='white', label=''))
+        
+        # Add total behaviors to legend
+        for base_name, color in total_behavior_colors.items():
             legend_elements.append(
-                Patch(facecolor=info['color'], 
-                      label=f"{info['base']} (large)")
+                Patch(facecolor=color, label=f"{base_name} (total)")
             )
+        
+        # Add "Other" category
+        legend_elements.append(Patch(facecolor=[1, 1, 1], label='Other'))
+        
+        ax.legend(handles=legend_elements, loc='center left', 
+                bbox_to_anchor=(1, 0.5), title='Behavioral States')
+        
+    else:
+        # Use the scatter plot approach for single row per larva, plotting ALL behaviors
+        ytick_positions = []
+        ytick_labels = []
+        
+        for i, larva_id in enumerate(larva_ids):
+            if 'global_state_large_state' not in larvae_data[larva_id] or 't' not in larvae_data[larva_id]:
+                continue  # Skip larvae without required data
+            
+            times = np.array(larvae_data[larva_id]['t']).flatten()
+            states = np.array(larvae_data[larva_id]['global_state_large_state']).flatten()
+            
+            # Check if times are sorted
+            if not np.all(np.diff(times) >= 0) and len(times) > 1:
+                # Sort times and states
+                sorted_indices = np.argsort(times)
+                times = times[sorted_indices]
+                states = states[sorted_indices]
+            
+            # Ensure both arrays have same length
+            min_len = min(len(times), len(states))
+            if min_len == 0:
+                continue
+                
+            times = times[:min_len]
+            states = states[:min_len]
+            
+            # Draw thin line across total time range
+            ax.plot([times[0], times[-1]], [i, i], 'k-', linewidth=0.5, alpha=0.2)
+            
+            # Draw colored segments for each behavior state with appropriate colors
+            # Plot ALL behaviors, not just run, cast, and stop
+            for state_val in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
+                if state_val in state_mapping:
+                    info = state_mapping[state_val]
+                    mask = states == state_val
+                    if np.any(mask):
+                        ax.scatter(times[mask], [i] * sum(mask), 
+                                 color=info['color'], s=5, marker='s', alpha=0.8)
+            
+            ytick_positions.append(i)
+            ytick_labels.append(str(larva_id))
+        
+        # Set axis properties
+        ax.set_yticks(ytick_positions)
+        ax.set_yticklabels(ytick_labels)
+        
+        # Add legend with all behavioral states
+        legend_elements = []
+        for state_val in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
+            if state_val in state_mapping:
+                info = state_mapping[state_val]
+                legend_elements.append(
+                    Line2D([0], [0], marker='s', color='w', 
+                          markerfacecolor=info['color'], markersize=8, 
+                          label=f"{info['base']}")
+                )
+        
+        ax.legend(handles=legend_elements, loc='upper right')
     
-    # Add a separator in the legend
-    legend_elements.append(Patch(facecolor='white', label=''))
+    # Set common axis properties
+    ax.set_xlabel('Time (seconds)')
+    ax.set_ylabel('Larva ID')
+    # Title removed as requested
+    ax.set_xlim(t_min, t_max)
     
-    # Add small behaviors to legend
-    for state_val in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]:
-        if state_val in state_mapping:
-            info = state_mapping[state_val]
-            legend_elements.append(
-                Patch(facecolor=info['color'], 
-                      label=f"{info['base']} (small)")
-            )
+    # Only show if we created our own figure and show_plot is True
+    if created_fig and show_plot:
+        plt.tight_layout()
+        plt.show()
     
-    # Add a separator in the legend
-    legend_elements.append(Patch(facecolor='white', label=''))
+    # Return the processed data
+    result_data = {}
+    for larva_id in larva_ids:
+        if 'global_state_large_state' in larvae_data[larva_id] and 't' in larvae_data[larva_id]:
+            result_data[larva_id] = {
+                'times': np.array(larvae_data[larva_id]['t']).flatten(),
+                'states': np.array(larvae_data[larva_id]['global_state_large_state']).flatten()
+            }
     
-    # Add total behaviors to legend
-    for base_name, color in total_behavior_colors.items():
-        legend_elements.append(
-            Patch(facecolor=color, label=f"{base_name} (total)")
-        )
-    
-    # Add "Other" category
-    legend_elements.append(Patch(facecolor=[1, 1, 1], label='Other'))
-    
-    plt.legend(handles=legend_elements, loc='center left', 
-              bbox_to_anchor=(1, 0.5), title='Behavioral States')
-    plt.tight_layout()
-    plt.show()
-    
-    return behavior_matrix
+    return result_data
 
 def _create_behavior_matrix(trx_data, show_separate_totals=True):
     """
@@ -2862,137 +2980,63 @@ def analyze_turn_rate_by_orientation_true(
         'smoothed_rates': smoothed_rates
     }
 
-def analyze_run_orientations_all(experiments_data):
-    """
-    Analyze run orientations across all experiments,
-    separating large runs, small runs, and total runs.
-    
-    Args:
-        experiments_data: Dict containing all experiments data
-        
-    Returns:
-        dict: Contains orientation data and statistics for large, small, and total runs
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from scipy.ndimage import gaussian_filter1d
-    
-    # Initialize separate storage for large, small, and total runs
-    large_run_orientations = []
-    small_run_orientations = []
+def analyze_run_orientations_all(experiments_data, bin_width=10, show_plot=True, ax=None, sigma=2):
+    """Analyze run orientations using tail-to-neck orientation definition."""
+    if ax is None and show_plot:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        created_fig = True
+    else:
+        created_fig = False
+
     all_run_orientations = []
-    total_larvae = 0
-    
-    # Handle nested data structure
-    if 'data' in experiments_data:
+
+    if isinstance(experiments_data, dict) and 'data' in experiments_data:
         data_to_process = experiments_data['data']
-        total_larvae = experiments_data['metadata']['total_larvae']
     else:
         data_to_process = experiments_data
-        total_larvae = len(data_to_process)
-    
-    # Process the data
-    if isinstance(data_to_process, dict):
-        results = analyze_run_orientations_single(data_to_process)
-        large_run_orientations.extend(results['large_run_orientations'])
-        small_run_orientations.extend(results['small_run_orientations'])
-        all_run_orientations.extend(results['all_run_orientations'])
-    else:
-        for exp_data in data_to_process.values():
-            results = analyze_run_orientations_single(exp_data)
-            large_run_orientations.extend(results['large_run_orientations'])
-            small_run_orientations.extend(results['small_run_orientations'])
-            all_run_orientations.extend(results['all_run_orientations'])
-    
-    # Convert to numpy arrays
-    large_run_orientations = np.array(large_run_orientations)
-    small_run_orientations = np.array(small_run_orientations)
-    all_run_orientations = np.array(all_run_orientations)
-    
-    # Create histograms for each type
-    bins = np.linspace(-180, 180, 31)  # 30 bins
-    bin_centers = (bins[:-1] + bins[1:]) / 2
-    
-    # Calculate histograms
-    hist_large = np.histogram(large_run_orientations, bins=bins, density=True)[0] if len(large_run_orientations) > 0 else np.zeros(36)
-    hist_small = np.histogram(small_run_orientations, bins=bins, density=True)[0] if len(small_run_orientations) > 0 else np.zeros(36)
-    hist_all = np.histogram(all_run_orientations, bins=bins, density=True)[0] if len(all_run_orientations) > 0 else np.zeros(36)
-    
-    # Apply smoothing
-    smoothed_large = gaussian_filter1d(hist_large, sigma=1)
-    smoothed_small = gaussian_filter1d(hist_small, sigma=1)
-    smoothed_all = gaussian_filter1d(hist_all, sigma=1)
-    
-    # Create figure with three subplots in a row
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 4))
-    
-    # Plot 1: Large runs
-    ax1.plot(bin_centers, hist_large, 'k-', alpha=0.3, linewidth=1)
-    ax1.plot(bin_centers, smoothed_large, 'r-', linewidth=2)
-    ax1.set_xlabel('Body orientation (°)')
-    ax1.set_ylabel('Relative probability')
-    ax1.set_xlim(-180, 180)
-    ax1.set_title(f'Large Runs (n={len(large_run_orientations)})')
-    
-    # Plot 2: Small runs
-    ax2.plot(bin_centers, hist_small, 'k-', alpha=0.3, linewidth=1)
-    ax2.plot(bin_centers, smoothed_small, 'b-', linewidth=2)
-    ax2.set_xlabel('Body orientation (°)')
-    ax2.set_ylabel('Relative probability')
-    ax2.set_xlim(-180, 180)
-    ax2.set_title(f'Small Runs (n={len(small_run_orientations)})')
-    
-    # Plot 3: All runs combined
-    ax3.plot(bin_centers, hist_all, 'k-', alpha=0.3, linewidth=1)
-    ax3.plot(bin_centers, smoothed_all, 'g-', linewidth=2)
-    ax3.set_xlabel('Body orientation (°)')
-    ax3.set_ylabel('Relative probability')
-    ax3.set_xlim(-180, 180)
-    ax3.set_title(f'All Runs Combined (n={len(all_run_orientations)})')
-    
-    # Add super title
-    plt.suptitle(f'Run Orientation Distributions (Total larvae: {total_larvae})', fontsize=14)
-    
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.85)  # Make room for the suptitle
-    plt.show()
-    
-    # Create comparison plot - all distributions on one plot
-    plt.figure(figsize=(6, 4))
-    
-    if len(large_run_orientations) > 0:
-        plt.plot(bin_centers, smoothed_large, 'r-', linewidth=2, label='Large runs')
-    
-    if len(small_run_orientations) > 0:
-        plt.plot(bin_centers, smoothed_small, 'b-', linewidth=2, label='Small runs')
-    
-    if len(all_run_orientations) > 0:
-        plt.plot(bin_centers, smoothed_all, 'g-', linewidth=2, label='All runs')
-    
-    plt.xlabel('Body orientation (°)')
-    plt.ylabel('Relative probability')
-    plt.xlim(-180, 180)
-    plt.title(f'Run Orientation Comparison (n={total_larvae} larvae)')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-    
-    return {
-        'large_run_orientations': large_run_orientations,
-        'small_run_orientations': small_run_orientations,
-        'all_run_orientations': all_run_orientations,
-        'hist_large': hist_large,
-        'hist_small': hist_small,
-        'hist_all': hist_all,
-        'bin_centers': bin_centers,
-        'smoothed_large': smoothed_large,
-        'smoothed_small': smoothed_small,
-        'smoothed_all': smoothed_all,
-        'n_larvae': total_larvae,
-        'n_large_runs': len(large_run_orientations),
-        'n_small_runs': len(small_run_orientations),
-        'n_total_runs': len(all_run_orientations)
-    }
+
+    for larva_id, larva_data in data_to_process.items():
+        try:
+            if 'global_state_large_state' not in larva_data:
+                continue
+            states = np.array(larva_data['global_state_large_state']).flatten()
+            runs = np.logical_or(states == 1, states == 0.5)
+            if runs.sum() == 0:
+                continue
+            orientations = get_orientation_array(larva_data)
+            if orientations is None:
+                continue
+            min_len = min(len(orientations), len(runs))
+            orientations = orientations[:min_len]
+            runs = runs[:min_len]
+            all_run_orientations.extend(orientations[runs])
+        except Exception as e:
+            print(f"Error processing larva {larva_id}: {str(e)}")
+
+    if not all_run_orientations:
+        ax.text(0.5, 0.5, "No run orientation data available", ha='center', va='center', transform=ax.transAxes)
+        return {'orientations': [], 'hist': np.array([]), 'bin_centers': np.array([])}
+
+    bins = np.arange(-180, 181, bin_width)
+    hist, bin_edges = np.histogram(all_run_orientations, bins=bins, density=True)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    smoothed_hist = gaussian_filter1d(hist, sigma=sigma)
+
+    ax.plot(bin_centers, smoothed_hist, color='black', linewidth=2)
+    ax.set_xlabel('Orientation (°)')
+    ax.set_ylabel('Probability Density')
+    ax.set_xlim(-180, 180)
+    ax.grid(True, alpha=0.3)
+    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+    ax.axvline(x=180, color='black', linestyle='--', alpha=0.5)
+    ax.axvline(x=-180, color='black', linestyle='--', alpha=0.5)
+
+    if created_fig and show_plot:
+        plt.tight_layout()
+        plt.show()
+
+    return {'orientations': all_run_orientations, 'hist': hist, 'bin_centers': bin_centers, 'smoothed_hist': smoothed_hist}
 
 
 
