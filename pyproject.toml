@@ -25,8 +25,8 @@ dependencies = [
 dev = ["pytest", "black", "flake8"]
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["src"]
+include = ["core*","viz*","utils*","analysis*"]
 
 [tool.setuptools.package-dir]
-anemotaxis = "src"
+"" = "src"
