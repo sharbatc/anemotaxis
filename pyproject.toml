@@ -26,7 +26,7 @@ dev = ["pytest", "black", "flake8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["core*","viz*","utils*","analysis*"]
+include = ["core*","viz*","utils*"]
 
 [tool.setuptools.package-dir]
 "" = "src"
