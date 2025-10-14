@@ -1527,7 +1527,6 @@ def plot_head_cast_frequency_over_time(analysis_results, show_xlabel=True, show_
     return plot_metric_over_time(
         analysis_results,
         color='purple',
-        slope_color='purple',
         show_xlabel=show_xlabel,
         show_ylabel=show_ylabel,
         **kwargs
@@ -1870,7 +1869,7 @@ def plot_cast_detection_results(experiments_data, cast_events_data, larva_ids=No
 
 
 
-def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test = 'ttest'):
+def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test = 'wilcoxon'):
     """
     Plot analysis of head cast bias when larvae are perpendicular to flow.
     Shows bias towards upstream vs downstream using box plots with individual data points.
@@ -1898,7 +1897,7 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
         created_fig = False
     
     # Check if we have data
-    if not bias_results or not bias_results.get('head_cast_data'):
+    if not bias_results :
         ax.text(0.5, 0.5, 'No perpendicular cast events found', 
                ha='center', va='center', transform=ax.transAxes, fontsize=14)
         if title:
@@ -1919,9 +1918,9 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
     # Choose color based on analysis type
     analysis_type = bias_results.get('analysis_type', 'first')
     color_map = {
-        'first': '#8B0000',   # Dark red
-        'last': '#DC143C',    # Crimson  
-        'all': '#FF6B6B'      # Light coral red
+        'first': '#4B0082',   # Indigo
+        'last': '#800080',    # Purple  
+        'all': '#DA70D6'      # Orchid
     }
     plot_color = color_map.get(analysis_type, '#E53935')
     colors = [plot_color, plot_color]
@@ -1944,7 +1943,7 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
         if len(d) > 0:
             jitter = np.random.uniform(-0.05, 0.05, len(d))  # Reduced jitter
             x_positions = [pos + j for j in jitter]
-            ax.scatter(x_positions, d, color=color, s=40, alpha=0.8, 
+            ax.scatter(x_positions, d, color=color, s=10, alpha=0.8, 
                       edgecolors='black', linewidth=0.5, zorder=5)
     
     # Add mean ± SE text boxes
@@ -2150,10 +2149,11 @@ Mean NI_y: {mean_NI_y_val:.3f}"""
     
     return fig
 
-def plot_navigational_index_boxplot(ni_single_results, figsize=(6, 6), save_path=None, ax=None):
+def plot_navigational_index_boxplot(ni_single_results, figsize=(4, 4), save_path=None, ax=None):
     """
     Plot box plots for NI_x and NI_y values with significance testing.
     Tests if each distribution is significantly different from 0.
+    Matches the aesthetic style of the head cast bias plot.
     
     Args:
         ni_single_results: Output from analyze_navigational_index_single_values
@@ -2166,6 +2166,7 @@ def plot_navigational_index_boxplot(ni_single_results, figsize=(6, 6), save_path
     """
     import matplotlib.pyplot as plt
     import numpy as np
+    from scipy import stats
     
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
@@ -2182,77 +2183,147 @@ def plot_navigational_index_boxplot(ni_single_results, figsize=(6, 6), save_path
     means = ni_single_results['means']
     n_larvae = ni_single_results['n_larvae']
     
-    # Prepare data for box plot
-    data_to_plot = [NI_x_clean, NI_y_clean]
-    labels = ['NI_x', 'NI_y']
+    # Data for box plot with closer spacing (matching head cast bias style)
+    data = [NI_x_clean, NI_y_clean]
+    positions = [1, 1.2]  # Closer spacing like head cast bias plot
+    labels_box = ['NI_x', 'NI_y']
     colors = ['blue', 'red']
     
-    # Create box plot
-    bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True, notch=True, showfliers=True)
+    # Create box plot with same styling as head cast bias
+    bp = ax.boxplot(data, positions=positions, patch_artist=True, 
+                   widths=0.1, showfliers=False,  # Reduced width, no outliers
+                   boxprops=dict(linewidth=1.5),
+                   whiskerprops=dict(linewidth=1.5),
+                   capprops=dict(linewidth=1.5),
+                   medianprops=dict(linewidth=2, color='black'))
     
-    # Color the boxes
-    for patch, color in zip(bp['boxes'], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.6)
+    # Color boxes with same alpha as head cast bias
+    for i, (box, color) in enumerate(zip(bp['boxes'], colors)):
+        box.set(facecolor=color, alpha=0.7, edgecolor='black', linewidth=1.5)
     
-    # Add horizontal line at y=0
-    ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    # Add individual data points with jitter (matching head cast bias style)
+    np.random.seed(42)
+    for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
+        if len(d) > 0:
+            jitter = np.random.uniform(-0.03, 0.03, len(d))  # Same jitter as head cast bias
+            x_positions = [pos + j for j in jitter]
+            ax.scatter(x_positions, d, color=color, s=40, alpha=0.8, 
+                      edgecolors='black', linewidth=0.5, zorder=5)
     
-    # Add significance markers and p-values
-    for i, label in enumerate(labels):
-        sig = significances[label]
-        p_val = p_values[label]
-        
-        # Get the position for the significance marker
-        if len(data_to_plot[i]) > 0:
-            y_pos = np.max(data_to_plot[i])
-            y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
-            y_offset = y_range * 0.05
+    # Add mean ± SE text boxes (matching head cast bias style)
+    for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
+        if len(d) > 0:
+            mean_val = np.mean(d)
+            se_val = stats.sem(d)
+            text_str = f"{mean_val:.3f}±{se_val:.3f}"
+            ax.text(pos, -0.4, text_str, ha='center', va='bottom',
+                   fontsize=10, color='black',
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
+                            edgecolor='gray', alpha=0.9))
+    
+    # Statistical significance testing between NI_x and NI_y (paired test)
+    if len(NI_x_clean) > 1 and len(NI_y_clean) > 1 and len(NI_x_clean) == len(NI_y_clean):
+        try:
+            # Paired t-test (since they're from the same larvae)
+            t_stat, p_value = stats.ttest_rel(NI_x_clean, NI_y_clean)
             
-            # if sig not in ["ns", "insufficient data"]:
-            #     ax.text(i + 1, y_pos + y_offset, sig, 
-            #            ha='center', va='bottom', fontsize=16, fontweight='bold')
-            
-            # # Add p-value as smaller text
-            # if not np.isnan(p_val):
-            #     ax.text(i + 1, y_pos + 2*y_offset, f'p={p_val:.3f}', 
-            #            ha='center', va='bottom', fontsize=8, alpha=0.7)
+            if not np.isnan(p_value):
+                if p_value < 0.001:
+                    ptext = "***"
+                elif p_value < 0.01:
+                    ptext = "**" 
+                elif p_value < 0.05:
+                    ptext = "*"
+                else:
+                    ptext = "ns"
+                
+                # Add horizontal comparison line (matching head cast bias style)
+                y_pos = 0.15  # Fixed position near top of plot
+                ax.plot([positions[0], positions[1]], [y_pos, y_pos], 'k-', lw=1.5)
+                ax.plot([positions[0], positions[0]], [y_pos-0.01, y_pos], 'k-', lw=1.5)
+                ax.plot([positions[1], positions[1]], [y_pos-0.01, y_pos], 'k-', lw=1.5)
+                ax.text(np.mean(positions), y_pos + 0.02, ptext, ha='center', va='bottom', 
+                       fontsize=14)
+        except:
+            pass  # Skip if paired test fails
     
-    # Add median and quartile values
-    for i, label in enumerate(labels):
-        if len(data_to_plot[i]) > 0:
-            median = np.median(data_to_plot[i])
-            
-            # Display median
-            ax.text(i + 1, median, f"{median:.3f}", ha='center', va='center',
-                   fontsize=10, fontweight='bold', color='white',
-                   bbox=dict(boxstyle="round,pad=0.2", facecolor='black', alpha=0.8))
-        
+    # Add chance level line at y=0 (matching head cast bias style)
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.7, linewidth=1)
     
-    # Formatting
-    ax.set_ylabel('Navigational Index')
-    ax.set_title('Navigational Index Values (Time-Averaged)')
-    ax.grid(False)  # Remove grid
+    # Configure plot limits (matching head cast bias proportions)
+    ax.set_ylim(-0.45, 0.2)
+    ax.set_xlim(0.8, 1.4)  # Adjusted for closer spacing
     
-    # Set axis limits and styling
-    ax.set_ylim(-0.3, 0.2)  # Set y-axis range from -0.5 to 0.2
+    # Labels and ticks (matching head cast bias style)
+    ax.set_ylabel('Navigational Index', fontsize=14)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels_box, fontsize=10, rotation=0)  # No rotation needed for short labels
+    ax.set_yticks([-0.4, -0.2, 0, 0.2])
+    ax.set_yticklabels(['-0.4', '-0.2', '0.0', '0.2'])
+    ax.tick_params(axis='x', which='major', labelsize=10, length=6)
+    ax.tick_params(axis='y', which='major', labelsize=14, length=6)
+    
+    # Style axes - detached appearance (matching head cast bias style)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_position(('outward', 10))
-    ax.spines['bottom'].set_position(('outward', 10))
+    ax.spines['left'].set_bounds(-0.4, 0.2)
+    ax.spines['bottom'].set_bounds(positions[0], positions[1])
+    ax.spines['bottom'].set_position(('outward', 2))
     
-    # Add sample size information
-    ax.text(0.02, 0.98, f'n = {n_larvae} larvae', transform=ax.transAxes, 
-           fontsize=10, va='top', ha='left', 
-           bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    # Title (matching head cast bias style)
+    ax.set_title('Navigational Index', fontsize=14, pad=20)
     
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    # Sample size in top right (matching head cast bias style)
+    ax.text(0.98, 0.9, f'n={n_larvae}', 
+           transform=ax.transAxes, fontsize=10, va='top', ha='right',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
+    
+    # Individual significance annotations for each NI against zero
+    for i, (pos, d, label) in enumerate(zip(positions, data, labels_box)):
+        if len(d) > 0:
+            # Test against zero
+            t_stat, p_val = stats.ttest_1samp(d, 0)
+            if p_val < 0.001:
+                sig_text = "***"
+            elif p_val < 0.01:
+                sig_text = "**"
+            elif p_val < 0.05:
+                sig_text = "*"
+            else:
+                sig_text = "ns"
+            
+            # Add significance text above each box
+            if sig_text != "ns":
+                data_max = np.max(d)
+                ax.text(pos, data_max + 0.03, sig_text, ha='center', va='bottom',
+                       fontsize=12, fontweight='bold')
+    
+    # Save and display
+    if save_path and created_fig:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
         print(f"Figure saved to {save_path}")
     
     if created_fig:
         plt.tight_layout()
         plt.show()
+        
+        # Print summary (matching head cast bias style)
+        print(f"\n=== NAVIGATIONAL INDEX ANALYSIS ===")
+        print(f"Number of larvae: {n_larvae}")
+        print(f"Mean NI_x: {means['NI_x']:.3f} (p={p_values['NI_x']:.4f}, {significances['NI_x']})")
+        print(f"Mean NI_y: {means['NI_y']:.3f} (p={p_values['NI_y']:.4f}, {significances['NI_y']})")
+        
+        # Test if significantly different from each other
+        if len(NI_x_clean) == len(NI_y_clean) and len(NI_x_clean) > 1:
+            try:
+                t_stat, p_paired = stats.ttest_rel(NI_x_clean, NI_y_clean)
+                print(f"Paired comparison NI_x vs NI_y: p={p_paired:.4f}")
+                if p_paired < 0.05:
+                    print("RESULT: NI_x and NI_y are significantly different from each other")
+                else:
+                    print("RESULT: NI_x and NI_y are not significantly different from each other")
+            except:
+                print("Could not perform paired comparison")
     
     return fig
 

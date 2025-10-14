@@ -1223,8 +1223,7 @@ def analyze_head_casts_by_orientation(experiments_data, bin_width=20, peak_thres
             'mean_hist': np.full_like(bin_centers, np.nan),
             'se_hist': np.full_like(bin_centers, np.nan),
             'bin_centers': bin_centers,
-            'n_larvae': 0,
-            'cast_events_data': cast_events_data
+            'n_larvae': 0
         }
     
     # Convert to arrays for analysis
@@ -1240,8 +1239,7 @@ def analyze_head_casts_by_orientation(experiments_data, bin_width=20, peak_thres
         'mean_hist': mean_head_casts,
         'se_hist': se_head_casts,
         'bin_centers': bin_centers,
-        'n_larvae': len(larva_data_list),
-        'cast_events_data': cast_events_data
+        'n_larvae': len(larva_data_list)
     }
 ### =============================================================================
 ######## ANALYSIS OVER TIME ########
