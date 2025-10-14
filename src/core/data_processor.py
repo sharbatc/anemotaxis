@@ -2277,8 +2277,8 @@ def analyze_head_cast_bias(cast_events_data, analysis_type='first'):
             'mean_larva_away_bias': np.nan,
             'se_larva_away_bias': np.nan,
             'p_value_wilcoxon': np.nan,
-            # 'p_value_ttest': np.nan,
-            # 'p_value_fisher_combined': np.nan,
+            'p_value_ttest': np.nan,
+            'p_value_fisher_combined': np.nan,
             'n_larvae': 0,
             'n_larvae_for_stats': 0,
             'analysis_type': analysis_type
@@ -2319,25 +2319,25 @@ def analyze_head_cast_bias(cast_events_data, analysis_type='first'):
             p_wilcoxon = 1.0
         
         # # ALTERNATIVE TESTS (commented out)
-        # # 1. One-sample t-test: Are per-larva towards biases significantly different from 0.5?
-        # from scipy.stats import ttest_1samp
-        # t_stat, p_ttest = ttest_1samp(filtered_towards_biases, 0.5)
-        # 
-        # # 2. Per-larva binomial tests combined (Fisher's method)
-        # from scipy.stats import combine_pvalues, binomtest
-        # individual_pvals = []
-        # for summary in larvae_for_stats:
-        #     # Binomial test for each individual larva
-        #     binom_result = binomtest(summary['towards_count'], 
-        #                            summary['total_count'], 
-        #                            0.5, alternative='two-sided')
-        #     individual_pvals.append(binom_result.pvalue)
-        # 
-        # # Combine p-values using Fisher's method
-        # if individual_pvals:
-        #     fisher_stat, p_fisher = combine_pvalues(individual_pvals, method='fisher')
-        # else:
-        #     p_fisher = np.nan
+        # 1. One-sample t-test: Are per-larva towards biases significantly different from 0.5?
+        from scipy.stats import ttest_1samp
+        t_stat, p_ttest = ttest_1samp(filtered_towards_biases, 0.5)
+        
+        # 2. Per-larva binomial tests combined (Fisher's method)
+        from scipy.stats import combine_pvalues, binomtest
+        individual_pvals = []
+        for summary in larvae_for_stats:
+            # Binomial test for each individual larva
+            binom_result = binomtest(summary['towards_count'], 
+                                   summary['total_count'], 
+                                   0.5, alternative='two-sided')
+            individual_pvals.append(binom_result.pvalue)
+        
+        # Combine p-values using Fisher's method
+        if individual_pvals:
+            fisher_stat, p_fisher = combine_pvalues(individual_pvals, method='fisher')
+        else:
+            p_fisher = np.nan
         
         print(f"\n📊 Statistical Tests (n={len(larvae_for_stats)} larvae with ≥{MIN_CASTS_FOR_STATS} casts):")
         print(f"   Wilcoxon signed-rank test: p={p_wilcoxon:.4f}")
@@ -2356,8 +2356,8 @@ def analyze_head_cast_bias(cast_events_data, analysis_type='first'):
         print(f"\n⚠️  Insufficient data for robust statistical testing")
         print(f"   Only {len(larvae_for_stats)} larvae with ≥{MIN_CASTS_FOR_STATS} perpendicular head casts")
         p_wilcoxon = np.nan
-        # p_ttest = np.nan
-        # p_fisher = np.nan
+        p_ttest = np.nan
+        p_fisher = np.nan
     
     print("-" * 60)
     print(f"TOTAL: {total_casts} {analysis_type} perpendicular head casts")
@@ -2379,8 +2379,8 @@ def analyze_head_cast_bias(cast_events_data, analysis_type='first'):
         'mean_larva_away_bias': mean_larva_away_bias,
         'se_larva_away_bias': se_larva_away_bias,
         'p_value_wilcoxon': p_wilcoxon if 'p_wilcoxon' in locals() else np.nan,
-        # 'p_value_ttest': p_ttest if 'p_ttest' in locals() else np.nan,
-        # 'p_value_fisher_combined': p_fisher if 'p_fisher' in locals() else np.nan,
+        'p_value_ttest': p_ttest if 'p_ttest' in locals() else np.nan,
+        'p_value_fisher_combined': p_fisher if 'p_fisher' in locals() else np.nan,
         'min_casts_threshold': MIN_CASTS_FOR_STATS,
         'n_larvae': len(larva_summaries),
         'n_larvae_for_stats': len(larvae_for_stats) if 'larvae_for_stats' in locals() else 0,

@@ -1870,7 +1870,7 @@ def plot_cast_detection_results(experiments_data, cast_events_data, larva_ids=No
 
 
 
-def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None):
+def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test = 'ttest'):
     """
     Plot analysis of head cast bias when larvae are perpendicular to flow.
     Shows bias towards upstream vs downstream using box plots with individual data points.
@@ -1958,16 +1958,24 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
                             edgecolor='gray', alpha=0.9))
     
-    # Statistical test annotation
+    # Statistical test annotatio
     if len(larva_towards_biases) > 1 and len(larva_away_biases) > 1:
         p_wilcoxon = bias_results.get('p_value_wilcoxon', np.nan)
-        
-        if not np.isnan(p_wilcoxon):
-            if p_wilcoxon < 0.001:
+        p_ttest = bias_results.get('p_value_ttest', np.nan)
+        p_fischer = bias_results.get('p_value_fisher_combined', np.nan)
+        if test == 'ttest':
+            p_value = p_ttest
+        elif test == 'fisher':
+            p_value = p_fischer
+        else:
+            p_value = p_wilcoxon
+
+        if not np.isnan(p_value):
+            if p_value < 0.001:
                 ptext = "***"
-            elif p_wilcoxon < 0.01:
+            elif p_value < 0.01:
                 ptext = "**" 
-            elif p_wilcoxon < 0.05:
+            elif p_value < 0.05:
                 ptext = "*"
             else:
                 ptext = "ns"
