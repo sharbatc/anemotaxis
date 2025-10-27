@@ -952,7 +952,7 @@ def plot_global_behavior_matrix(trx_data, show_plot=True, ax=None):
 def plot_orientation_histogram(analysis_results, ax=None, show_plot=True, linestyle = '-',
                               show_se=True, se_alpha=0.3, color=None, label=None,
                               xlabel=None, ylabel=None, show_xlabel=True, show_ylabel=True,
-                              title=None, xlim=(-185, 185), show_legend=True, ylim=None, 
+                              title=None, xlim=(-185, 185), ylim=None, show_legend=True, 
                               min_amplitude=None, plot_type='run'):
     """
     Universal function to plot any histogram with error bars across orientations.
@@ -1066,7 +1066,7 @@ def plot_orientation_histogram(analysis_results, ax=None, show_plot=True, linest
     # Set y-axis limits - handle amplitude plots differently
     if ylim:
         ax.set_ylim(ylim)
-        y_max = ylim[1]
+        y_min, y_max = ax.get_ylim()
     elif plot_type == 'turn_amplitude':
         # For amplitude plots, set appropriate range
         data_max = np.nanmax(valid_mean + valid_se) if len(valid_se) > 0 else np.nanmax(valid_mean)
@@ -1077,7 +1077,8 @@ def plot_orientation_histogram(analysis_results, ax=None, show_plot=True, linest
         # For probability plots, start from 0
         y_min, y_max = ax.get_ylim()
         y_max_rounded = np.ceil(y_max * 50) / 50  # Round up to nearest 0.02
-        ax.set_ylim(0, y_max_rounded)
+        y_min_rounded = 0
+        ax.set_ylim(y_min_rounded, y_max_rounded)
         y_max = y_max_rounded
 
     # Set y-ticks with appropriate intervals based on plot type
@@ -1138,25 +1139,6 @@ def plot_orientation_histogram_polar(analysis_results, ax=None, show_plot=True,
                                    min_amplitude=None, plot_type='run'):
     """
     Universal function to plot orientation histogram in polar coordinates as bars with optional standard error lines.
-    
-    Args:
-        analysis_results: Dictionary containing histogram data
-        ax: Matplotlib polar axis to plot on
-        show_plot: Whether to display the plot
-        control: If True, use different styling
-        show_se: Whether to show standard error lines
-        se_alpha: Alpha transparency for standard error
-        color: Color for the plot (auto-determined if None)
-        label: Custom label for the plot
-        title: Plot title
-        bar_style: Whether to use bar style (True) or line style (False)
-        tick_fontsize: Font size for tick labels
-        n_radial_ticks: Number of radial ticks to show
-        min_amplitude: Minimum amplitude for turn amplitude plots
-        plot_type: Type of analysis ('run', 'turn', 'backup', 'velocity', 'head_cast', 'turn_amplitude')
-    
-    Returns:
-        The matplotlib polar axis used for plotting
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1198,64 +1180,111 @@ def plot_orientation_histogram_polar(analysis_results, ax=None, show_plot=True,
     se_hist = np.array(analysis_results.get('se_hist', np.zeros_like(mean_hist)))
     bin_centers = np.array(analysis_results['bin_centers'])
     
-    # Create mask for valid (non-NaN) data
-    valid_mask = ~np.isnan(mean_hist)
+    # For turn amplitude, apply minimum amplitude filter AND ensure we have valid data
+    if is_amplitude and min_amplitude is not None:
+        # For amplitude data, we need to handle this differently
+        # Instead of filtering out data, set values below threshold to NaN
+        filtered_mean = mean_hist.copy()
+        filtered_se = se_hist.copy()
+        
+        # Set values below threshold to NaN instead of removing them
+        below_threshold = mean_hist < min_amplitude
+        filtered_mean[below_threshold] = np.nan
+        filtered_se[below_threshold] = np.nan
+        
+        # Also filter out originally NaN values
+        originally_nan = np.isnan(mean_hist)
+        
+        # Check if we have any valid data after filtering
+        valid_data_mask = ~(below_threshold | originally_nan)
+        
+        if not np.any(valid_data_mask):
+            ax.text(0, 0, f"No valid {plot_type} data available\n(min amplitude: {min_amplitude}°)", 
+                    ha='center', va='center', transform=ax.transAxes, fontsize=10)
+            return ax
+            
+        # Use filtered data but keep original bin structure
+        plot_mean = filtered_mean
+        plot_se = filtered_se
+        plot_bins = bin_centers
+        
+    else:
+        # For non-amplitude data, just handle NaN values
+        plot_mean = mean_hist
+        plot_se = se_hist
+        plot_bins = bin_centers
+        
+        # Check for any valid data
+        if np.all(np.isnan(plot_mean)):
+            ax.text(0, 0, "No valid orientation data available", 
+                    ha='center', va='center', transform=ax.transAxes, fontsize=10)
+            return ax
     
-    if not np.any(valid_mask):
-        ax.text(0, 0, "No valid orientation data available", 
-                ha='center', va='center', transform=ax.transAxes)
-        return ax
+    # Convert ALL bins to radians (keep the full structure)
+    theta = np.deg2rad(plot_bins)
     
-    # Filter to only valid data
-    valid_bins = bin_centers[valid_mask]
-    valid_mean = mean_hist[valid_mask]
-    valid_se = se_hist[valid_mask]
+    # Calculate bin width using original bin spacing
+    if len(bin_centers) > 1:
+        bin_width_deg = bin_centers[1] - bin_centers[0]
+    else:
+        bin_width_deg = 20  # Default fallback
     
-    # Convert to radians
-    theta = np.deg2rad(valid_bins)
-    
-    # Calculate bin width for bar plotting
-    bin_width_deg = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 20
     bin_width_rad = np.deg2rad(bin_width_deg)
 
     if bar_style:
-        # Plot as polar bars - USE FILTERED DATA
-        bars = ax.bar(theta, valid_mean, width=bin_width_rad, 
+        # Plot ALL bars, including NaN ones (they will be invisible)
+        bars = ax.bar(theta, plot_mean, width=bin_width_rad, 
                      color=color, alpha=0.7, edgecolor='black', linewidth=0.5)
         
-        # Plot standard error as lines on top of bars
-        if show_se and n_subjects > 1 and len(valid_se) > 0:
-            upper_bound = valid_mean + valid_se
-            lower_bound = valid_mean - valid_se
-            
-            for i, (th, mean_val, se_val) in enumerate(zip(theta, valid_mean, valid_se)):
-                ax.plot([th, th], [lower_bound[i], upper_bound[i]], 
-                       color=color, linewidth=1.5, alpha=0.8)
-                cap_width = bin_width_rad * 0.3
-                ax.plot([th - cap_width/2, th + cap_width/2], 
-                       [upper_bound[i], upper_bound[i]], 
-                       color=color, linewidth=1.5, alpha=0.8)
-                ax.plot([th - cap_width/2, th + cap_width/2], 
-                       [lower_bound[i], lower_bound[i]], 
-                       color=color, linewidth=1.5, alpha=0.8)
+        # Plot standard error only for valid (non-NaN) values
+        if show_se and n_subjects > 1 and len(plot_se) > 0:
+            for i, (th, mean_val, se_val) in enumerate(zip(theta, plot_mean, plot_se)):
+                # Only plot error bars for finite values
+                if np.isfinite(mean_val) and np.isfinite(se_val) and se_val > 0:
+                    upper_bound = mean_val + se_val
+                    lower_bound = mean_val - se_val
+                    
+                    # Plot error bar line
+                    ax.plot([th, th], [lower_bound, upper_bound], 
+                           color=color, linewidth=1.5, alpha=0.8)
+                    
+                    # Plot caps
+                    cap_width = bin_width_rad * 0.3
+                    ax.plot([th - cap_width/2, th + cap_width/2], 
+                           [upper_bound, upper_bound], 
+                           color=color, linewidth=1.5, alpha=0.8)
+                    ax.plot([th - cap_width/2, th + cap_width/2], 
+                           [lower_bound, lower_bound], 
+                           color=color, linewidth=1.5, alpha=0.8)
     else:
-        # Plot as polar line
-        ax.plot(theta, valid_mean, color=color, linewidth=2, label=label)
-        if show_se and len(valid_se) > 0:
-            ax.fill_between(theta, valid_mean - valid_se, valid_mean + valid_se,
-                           color=color, alpha=se_alpha)
+        # For line plots, filter out NaN values
+        valid_mask = np.isfinite(plot_mean)
+        if np.any(valid_mask):
+            valid_theta = theta[valid_mask]
+            valid_mean = plot_mean[valid_mask]
+            valid_se = plot_se[valid_mask] if len(plot_se) > 0 else []
+            
+            ax.plot(valid_theta, valid_mean, color=color, linewidth=2, label=label)
+            if show_se and len(valid_se) > 0:
+                ax.fill_between(valid_theta, valid_mean - valid_se, valid_mean + valid_se,
+                               color=color, alpha=se_alpha)
     
     # Polar plot formatting
     ax.set_theta_zero_location('E')
     ax.set_theta_direction(1)
     
-    # Set radial limits based on data type
+    # Set radial limits based on data type - use only valid data for scaling
     if is_amplitude or plot_type == 'turn_amplitude':
         # For amplitude data, start from min_amplitude and adjust maximum
-        data_max = np.nanmax(valid_mean + valid_se) if len(valid_se) > 0 else np.nanmax(valid_mean)
+        valid_data = plot_mean[np.isfinite(plot_mean)]
+        valid_se_data = plot_se[np.isfinite(plot_se)] if len(plot_se) > 0 else []
         
-        # Handle case where all values are NaN
-        if np.isnan(data_max):
+        if len(valid_data) > 0:
+            if len(valid_se_data) > 0:
+                data_max = np.nanmax(valid_data + valid_se_data[np.isfinite(valid_se_data)])
+            else:
+                data_max = np.nanmax(valid_data)
+        else:
             data_max = min_amplitude if min_amplitude is not None else 180
             
         y_min = min_amplitude if min_amplitude is not None else 60
@@ -1263,11 +1292,19 @@ def plot_orientation_histogram_polar(analysis_results, ax=None, show_plot=True,
         ax.set_ylim(y_min, r_max)
     else:
         # For probability data, start from 0
-        r_max = np.nanmax(valid_mean + valid_se) if len(valid_se) > 0 else np.nanmax(valid_mean)
+        valid_data = plot_mean[np.isfinite(plot_mean)]
+        valid_se_data = plot_se[np.isfinite(plot_se)] if len(plot_se) > 0 else []
         
-        # Handle case where all values are NaN
-        if np.isnan(r_max) or r_max <= 0:
+        if len(valid_data) > 0:
+            if len(valid_se_data) > 0:
+                r_max = np.nanmax(valid_data + valid_se_data[np.isfinite(valid_se_data)])
+            else:
+                r_max = np.nanmax(valid_data)
+        else:
             r_max = 1.0  # Default safe value
+            
+        if np.isnan(r_max) or r_max <= 0:
+            r_max = 1.0
             
         r_max_rounded = np.ceil(r_max * 100) / 100  # Round up to nearest 0.01
         ax.set_ylim(0, r_max_rounded)
@@ -1324,14 +1361,162 @@ def plot_orientation_histogram_polar(analysis_results, ax=None, show_plot=True,
 
     return ax
 
+def plot_head_cast_orientation_by_turn_success(head_cast_results, ax=None, show_xlabel=True, ylabel='Head Cast Number', ylim=None):
+    """
+    Plot head cast frequency by orientation, separated by turn success.
+    Shows successful turns, unsuccessful casts, and all casts in different shades of purple.
+    Uses the same aesthetics as plot_orientation_histogram.
+    
+    Args:
+        head_cast_results: Results from analyze_head_casts_by_orientation with separate_by_turn_success=True
+        ax: Matplotlib axis (optional)
+        show_xlabel: Whether to show x-axis label
+        ylabel: Y-axis label
+        ylim: Y-axis limits (optional)
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Check if this is separated by turn success
+    if not head_cast_results.get('separate_by_turn_success', False):
+        # Fall back to regular plotting
+        plot_orientation_histogram(head_cast_results, ax=ax, show_xlabel=show_xlabel, ylabel=ylabel, ylim=ylim)
+        return ax
+    
+    bin_centers = head_cast_results['bin_centers']
+    
+    # Get the three datasets
+    mean_successful = np.array(head_cast_results['mean_hist_successful'])
+    mean_unsuccessful = np.array(head_cast_results['mean_hist_unsuccessful']) 
+    mean_all = np.array(head_cast_results['mean_hist_all'])
+    
+    se_successful = np.array(head_cast_results['se_hist_successful'])
+    se_unsuccessful = np.array(head_cast_results['se_hist_unsuccessful'])
+    se_all = np.array(head_cast_results['se_hist_all'])
+    
+    # Define three shades of purple (lightest to darkest)
+    purple_all = '#D8BFD8'        # Thistle (lightest)
+    purple_unsuccessful = '#9370DB'  # Medium Slate Blue (medium)
+    purple_successful = '#4B0082'    # Indigo (darkest)
+    
+    # Create masks for valid (non-NaN) data for each dataset
+    valid_all = ~np.isnan(mean_all)
+    valid_successful = ~np.isnan(mean_successful)
+    valid_unsuccessful = ~np.isnan(mean_unsuccessful)
+    
+    # Plot all casts (lightest purple, behind everything)
+    if np.any(valid_all):
+        valid_bins_all = bin_centers[valid_all]
+        valid_mean_all = mean_all[valid_all]
+        valid_se_all = se_all[valid_all]
+        
+        ax.fill_between(valid_bins_all, 
+                       valid_mean_all - valid_se_all, 
+                       valid_mean_all + valid_se_all,
+                       color=purple_all, alpha=0.3)
+        ax.plot(valid_bins_all, valid_mean_all, color=purple_all, linewidth=2, 
+               label='All casts')
+    
+    # Plot unsuccessful casts (medium purple)
+    if np.any(valid_unsuccessful):
+        valid_bins_unsuccessful = bin_centers[valid_unsuccessful]
+        valid_mean_unsuccessful = mean_unsuccessful[valid_unsuccessful]
+        valid_se_unsuccessful = se_unsuccessful[valid_unsuccessful]
+        
+        ax.fill_between(valid_bins_unsuccessful, 
+                       valid_mean_unsuccessful - valid_se_unsuccessful, 
+                       valid_mean_unsuccessful + valid_se_unsuccessful,
+                       color=purple_unsuccessful, alpha=0.3)
+        ax.plot(valid_bins_unsuccessful, valid_mean_unsuccessful, color=purple_unsuccessful, linewidth=2, 
+               label='Casts → no turn')
+    
+    # Plot successful turns (darkest purple, on top)
+    if np.any(valid_successful):
+        valid_bins_successful = bin_centers[valid_successful]
+        valid_mean_successful = mean_successful[valid_successful]
+        valid_se_successful = se_successful[valid_successful]
+        
+        ax.fill_between(valid_bins_successful, 
+                       valid_mean_successful - valid_se_successful, 
+                       valid_mean_successful + valid_se_successful,
+                       color=purple_successful, alpha=0.3)
+        ax.plot(valid_bins_successful, valid_mean_successful, color=purple_successful, linewidth=2, 
+               label='Casts → turn')
+    
+    # Apply the same styling as plot_orientation_histogram
+    
+    # Remove all spines except bottom and left
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['bottom'].set_visible(True)
+    ax.spines['left'].set_visible(True)
 
+    # Detach axes from each other
+    ax.spines['bottom'].set_position(('outward', 10))
+    ax.spines['left'].set_position(('outward', 10))
+
+    # Set axis limits and ticks
+    ax.set_xlim(-180, 180)
+    ax.set_xticks([-180, -90, 0, 90, 180])
+    
+    # Set y-axis limits and ticks like plot_orientation_histogram
+    if ylim:
+        ax.set_ylim(ylim)
+        y_max = ylim[1]
+    else:
+        # Calculate y_max from data
+        valid_data = []
+        if np.any(valid_all):
+            valid_data.extend(mean_all[valid_all] + se_all[valid_all])
+        if np.any(valid_successful):
+            valid_data.extend(mean_successful[valid_successful] + se_successful[valid_successful])
+        if np.any(valid_unsuccessful):
+            valid_data.extend(mean_unsuccessful[valid_unsuccessful] + se_unsuccessful[valid_unsuccessful])
+        
+        if valid_data:
+            y_max = max(valid_data)
+            y_max = np.ceil(y_max)  # Round up to nearest integer
+        else:
+            y_max = 10  # Default fallback
+        
+        ax.set_ylim(0, y_max)
+    
+    # Set y-ticks with 1 as interval (for head cast number)
+    y_ticks = np.arange(0, y_max + 1, 1)
+    ax.set_yticks(y_ticks)
+    
+    # Add reference lines at key orientations (behind the plot)
+    for x_pos in [-180, -90, 0, 90, 180]:
+        ax.axvline(x=x_pos, color='gray', linestyle='--', alpha=0.5, zorder=0)
+    
+    # Labels
+    if show_xlabel:
+        ax.set_xlabel('Body Orientations (°)')
+    ax.set_ylabel(ylabel)
+    
+    # Add legend (simple, clean style)
+    ax.legend(loc='upper right', fontsize=9, frameon=True, fancybox=False, shadow=False)
+    
+    # Add summary statistics as text (smaller, less prominent)
+    # if 'summary_stats' in head_cast_results:
+    #     stats = head_cast_results['summary_stats']
+    #     stats_text = (f"Turns: {stats['successful_turns']}/{stats['total_casts']} ({stats['turn_rate']:.0f}%)")
+    #     ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+    #             verticalalignment='top', fontsize=8, 
+    #             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
+    
+    return ax
 ##### Metric Over Time Plotting #####
 
 
 def plot_metric_over_time(analysis_results, show_plot=True, ax=None, show_error=True, 
-                         show_individuals=False, label=None, xlabel='Time (s)', ylabel = None, 
+                         show_individuals=False, label=None, xlabel='Time (s)', ylabel=None, 
                          color=None, title=None, ylim=None, show_slope=True, show_xlabel=True, 
-                         show_ylabel=True, min_amplitude=None, plot_type='run'):
+                         show_ylabel=True, min_amplitude=None, plot_type='run', linestyle='-',
+                         se_alpha=0.3):
     """
     Universal function to plot any metric over time with error bars across individuals.
     
@@ -1348,6 +1533,8 @@ def plot_metric_over_time(analysis_results, show_plot=True, ax=None, show_error=
         show_individuals: Whether to show individual traces
         label: Custom label for the plot
         xlabel: X-axis label
+        ylabel: Y-axis label (auto-determined if None)
+        color: Line color (auto-determined if None)
         title: Plot title
         ylim: Y-axis limits as tuple (min, max)
         show_slope: Whether to show linear fit
@@ -1355,6 +1542,8 @@ def plot_metric_over_time(analysis_results, show_plot=True, ax=None, show_error=
         show_ylabel: Whether to show y-axis label
         min_amplitude: Minimum amplitude for turn amplitude plots
         plot_type: Type of analysis ('run', 'turn', 'backup', 'velocity', 'head_cast', 'turn_amplitude')
+        linestyle: Line style for the main plot line (default: '-')
+        se_alpha: Alpha transparency for standard error shading (default: 0.3)
     
     Returns:
         The matplotlib axis used for plotting
@@ -1375,8 +1564,10 @@ def plot_metric_over_time(analysis_results, show_plot=True, ax=None, show_error=
     
     # Get configuration for this plot type
     config = plot_configs.get(plot_type, plot_configs['run'])
-    color = config['color']
-    ylabel = config['ylabel']
+    if color is None:
+        color = config['color']
+    if ylabel is None:
+        ylabel = config['ylabel']
     
     # Extract data using standardized keys
     time_centers = analysis_results.get('time_centers', [])
@@ -1408,17 +1599,18 @@ def plot_metric_over_time(analysis_results, show_plot=True, ax=None, show_error=
     if show_individuals and len(individual_arrays) > 0:
         for i in range(len(individual_arrays)):
             ax.plot(time_centers, individual_arrays[i], 
-                   alpha=0.2, color=color, linewidth=0.5)
+                   alpha=0.2, color=color, linewidth=0.5, linestyle=linestyle)
     
-    # Plot mean line
-    ax.plot(time_centers, mean_values, color=color, linewidth=2, label=label)
+    # Plot mean line with specified linestyle
+    ax.plot(time_centers, mean_values, color=color, linewidth=2, 
+            label=label, linestyle=linestyle)
     
     # Plot error bars if requested
     if show_error and len(se_values) > 0 and n_subjects > 1:
         ax.fill_between(time_centers, 
                        np.array(mean_values) - np.array(se_values), 
                        np.array(mean_values) + np.array(se_values),
-                       alpha=0.3, color=color)
+                       alpha=se_alpha, color=color)
     
     # Fit and plot slope if requested
     slope_text = ""
@@ -1435,7 +1627,7 @@ def plot_metric_over_time(analysis_results, show_plot=True, ax=None, show_error=
             # Generate fitted line
             fitted_line = slope * time_centers + intercept
             
-            # Plot fitted line
+            # Plot fitted line (always dashed for slope)
             ax.plot(time_centers, fitted_line, 
                    color=color, linestyle='--', linewidth=1.5)
             
@@ -1869,17 +2061,216 @@ def plot_cast_detection_results(experiments_data, cast_events_data, larva_ids=No
 
 
 
-def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test = 'wilcoxon'):
+# def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test = 'wilcoxon'):
+#     """
+#     Plot analysis of head cast bias when larvae are perpendicular to flow.
+#     Shows bias towards upstream vs downstream using box plots with individual data points.
+    
+#     Args:
+#         bias_results: Output from analyze_head_cast_bias
+#         figsize: Figure size (width, height)
+#         save_path: Optional path to save the figure
+#         ax: Optional matplotlib axis to plot on
+#         title: Optional custom title for the plot
+        
+#     Returns:
+#         Figure object
+#     """
+#     import matplotlib.pyplot as plt
+#     import numpy as np
+#     from scipy import stats
+    
+#     # Create axis if none provided
+#     if ax is None:
+#         fig, ax = plt.subplots(figsize=figsize)
+#         created_fig = True
+#     else:
+#         fig = ax.get_figure()
+#         created_fig = False
+    
+#     # Check if we have data
+#     if not bias_results :
+#         ax.text(0.5, 0.5, 'No perpendicular cast events found', 
+#                ha='center', va='center', transform=ax.transAxes, fontsize=14)
+#         if title:
+#             ax.set_title(title)
+#         else:
+#             ax.set_title('Head Cast Bias Analysis')
+#         return fig
+    
+#     # Get per-larva data
+#     larva_towards_biases = [summary['towards_bias'] for summary in bias_results['larva_summaries']]
+#     larva_away_biases = [summary['away_bias'] for summary in bias_results['larva_summaries']]
+    
+#     # Data for box plot with closer spacing
+#     data = [larva_towards_biases, larva_away_biases]
+#     positions = [1, 1.3]  # Reduced spacing from [1, 2] to [1, 1.8]
+#     labels_box = ['Towards Wind', 'Away from Wind']
+    
+#     # Choose color based on analysis type
+#     analysis_type = bias_results.get('analysis_type', 'first')
+#     color_map = {
+#         'turn': '#4B0082',   # Indigo
+#         'first': '#663399',  # Rebecca Purple
+#         'last': '#9932CC',    # Dark Orchid 
+#         'all': '#8A2BE2'      # Blue Violet
+#     }
+#     plot_color = color_map.get(analysis_type, '#E53935')
+#     colors = [plot_color, plot_color]
+    
+#     # Create box plot with more prominent median line
+#     bp = ax.boxplot(data, positions=positions, patch_artist=True, 
+#                    widths=0.2, showfliers=False,
+#                    boxprops=dict(linewidth=1.5),
+#                    whiskerprops=dict(linewidth=1.5),
+#                    capprops=dict(linewidth=1.5),
+#                    medianprops=dict(linewidth=3, color='white'))  # Make median more visible
+    
+#     # Color boxes
+#     for i, (box, color) in enumerate(zip(bp['boxes'], colors)):
+#         box.set(facecolor=color, alpha=0.7, edgecolor='black', linewidth=1.5)
+    
+#     # Add individual data points with jitter
+#     np.random.seed(42)
+#     for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
+#         if len(d) > 0:
+#             jitter = np.random.uniform(-0.05, 0.05, len(d))  # Reduced jitter
+#             x_positions = [pos + j for j in jitter]
+#             ax.scatter(x_positions, d, color=color, s=10, alpha=0.8, 
+#                       edgecolors='black', linewidth=0.5, zorder=5)
+    
+#     # Add mean ± SE text boxes (moved lower to avoid overlap with median)
+#     for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
+#         if len(d) > 0:
+#             mean_val = np.mean(d)
+#             se_val = stats.sem(d)
+#             text_str = f"Mean: {mean_val:.2f}±{se_val:.2f}"
+#             ax.text(pos, -0.25, text_str, ha='center', va='bottom',
+#                    fontsize=9, color='black',
+#                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
+#                             edgecolor='gray', alpha=0.9))
+    
+#     # Add explicit median annotations
+#     for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
+#         if len(d) > 0:
+#             median_val = np.median(d)
+#             # Position median text slightly to the right of the box
+#             ax.text(pos + 0.12, median_val, f"Median: {median_val:.2f}", 
+#                    ha='left', va='center', fontsize=9, fontweight='bold',
+#                    bbox=dict(boxstyle="round,pad=0.2", facecolor='yellow', 
+#                             alpha=0.8, edgecolor='black'))
+    
+#     # Statistical test annotation
+#     if len(larva_towards_biases) > 1 and len(larva_away_biases) > 1:
+#         p_wilcoxon = bias_results.get('p_value_wilcoxon', np.nan)
+#         p_ttest = bias_results.get('p_value_ttest', np.nan)
+#         p_fischer = bias_results.get('p_value_fisher_combined', np.nan)
+#         if test == 'ttest':
+#             p_value = p_ttest
+#         elif test == 'fisher':
+#             p_value = p_fischer
+#         else:
+#             p_value = p_wilcoxon
+
+#         if not np.isnan(p_value):
+#             if p_value < 0.001:
+#                 ptext = "***"
+#             elif p_value < 0.01:
+#                 ptext = "**" 
+#             elif p_value < 0.05:
+#                 ptext = "*"
+#             else:
+#                 ptext = "ns"
+            
+#             # Add horizontal comparison line
+#             y_pos = 1.05
+#             ax.plot([positions[0], positions[1]], [y_pos, y_pos], 'k-', lw=1.5)
+#             ax.plot([positions[0], positions[0]], [y_pos-0.02, y_pos], 'k-', lw=1.5)
+#             ax.plot([positions[1], positions[1]], [y_pos-0.02, y_pos], 'k-', lw=1.5)
+#             ax.text(np.mean(positions), y_pos + 0.03, ptext, ha='center', va='bottom', 
+#                    fontsize=14)
+    
+#     # Add chance level line
+#     ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7, linewidth=1)
+    
+#     # Configure plot limits (adjusted to accommodate median annotations)
+#     ax.set_ylim(-0.3, 1.15)
+#     ax.set_xlim(0.7, 1.7)  # Wider to accommodate median text
+    
+#     # Labels and ticks
+#     ax.set_ylabel('Probability', fontsize=14)
+#     ax.set_xticks(positions)
+#     ax.set_xticklabels(labels_box)
+#     ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+#     ax.set_yticklabels(['0.0', '0.2', '0.4', '0.6', '0.8', '1.0'])
+#     ax.tick_params(axis='x', which='major', labelsize=10, length=6, rotation=20)
+#     ax.tick_params(axis='y', which='major', labelsize=14, length=6)
+    
+#     # Style axes - detached appearance
+#     ax.spines['top'].set_visible(False)
+#     ax.spines['right'].set_visible(False)
+#     ax.spines['left'].set_bounds(0, 1)
+#     ax.spines['bottom'].set_bounds(positions[0], positions[1])
+#     ax.spines['bottom'].set_position(('outward', 2))
+    
+#     # Title
+#     if title:
+#         ax.set_title(title, fontsize=14, pad=20)
+#     else:
+#         title_map = {'turn': 'Turn Bias', 'first': 'First Head Cast Bias', 'last': 'Last Head Cast Bias', 'all': 'All Head Cast Bias'}
+#         ax.set_title(title_map.get(analysis_type, "Head Cast Bias"),
+#                     fontsize=14, pad=20)
+    
+#     # Sample size in top right
+#     n_larvae = bias_results.get('n_larvae', 0)
+#     ax.text(0.98, 0.9, f'n={n_larvae}', 
+#            transform=ax.transAxes, fontsize=10, va='top', ha='right',
+#            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
+    
+#     # Save and display
+#     if save_path and created_fig:
+#         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+#         print(f"Figure saved to {save_path}")
+    
+#     if created_fig:
+#         plt.tight_layout()
+#         plt.show()
+        
+#         # Print summary
+#         analysis_type = bias_results.get('analysis_type', 'first')
+#         print(f"\n=== HEAD CAST DIRECTION BIAS ANALYSIS ({analysis_type.upper()}) ===")
+#         print(f"Total perpendicular cast events: {bias_results.get('total_casts', 0)}")
+#         print(f"Number of larvae: {bias_results.get('n_larvae', 0)}")
+#         print(f"Towards wind head casts: {bias_results.get('total_towards', 0)} ({bias_results.get('overall_towards_bias', 0):.1%})")
+#         print(f"Away from wind head casts: {bias_results.get('total_away', 0)} ({bias_results.get('overall_away_bias', 0):.1%})")
+        
+#         p_wilcoxon = bias_results.get('p_value_wilcoxon', np.nan)
+#         if not np.isnan(p_wilcoxon):
+#             print(f"Wilcoxon signed-rank test p-value: {p_wilcoxon:.4f}")
+            
+#             if p_wilcoxon < 0.05:
+#                 bias_direction = "towards wind" if bias_results.get('mean_larva_towards_bias', 0) > 0.5 else "away from wind"
+#                 print(f"RESULT: Significant bias toward {bias_direction} head casts (p < 0.05)")
+#             else:
+#                 print("RESULT: No significant bias detected (p ≥ 0.05)")
+#         else:
+#             print("RESULT: Statistical testing not performed (insufficient data)")
+    
+#     return fig
+
+def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test='binomial'):
     """
     Plot analysis of head cast bias when larvae are perpendicular to flow.
     Shows bias towards upstream vs downstream using box plots with individual data points.
+    Updated to handle both per-larva and pooled analysis results.
     
     Args:
-        bias_results: Output from analyze_head_cast_bias
+        bias_results: Output from analyze_head_cast_bias or analyze_head_cast_bias_pooled
         figsize: Figure size (width, height)
         save_path: Optional path to save the figure
         ax: Optional matplotlib axis to plot on
         title: Optional custom title for the plot
+        test: Statistical test to display ('wilcoxon', 'ttest', 'fisher', 'binomial')
         
     Returns:
         Figure object
@@ -1897,7 +2288,7 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
         created_fig = False
     
     # Check if we have data
-    if not bias_results :
+    if not bias_results:
         ax.text(0.5, 0.5, 'No perpendicular cast events found', 
                ha='center', va='center', transform=ax.transAxes, fontsize=14)
         if title:
@@ -1906,32 +2297,68 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
             ax.set_title('Head Cast Bias Analysis')
         return fig
     
-    # Get per-larva data
-    larva_towards_biases = [summary['towards_bias'] for summary in bias_results['larva_summaries']]
-    larva_away_biases = [summary['away_bias'] for summary in bias_results['larva_summaries']]
+    # Determine if this is pooled or per-larva analysis
+    is_pooled = bias_results.get('method') == 'pooled'
+    
+    if is_pooled:
+        # Handle pooled results - use per-larva summaries for box plot if available
+        total_towards = bias_results.get('total_towards', 0)
+        total_away = bias_results.get('total_away', 0)
+        total_casts = bias_results.get('total_casts', 0)
+        pooled_towards_bias = bias_results.get('pooled_towards_bias', np.nan)
+        pooled_away_bias = bias_results.get('pooled_away_bias', np.nan)
+        confidence_interval = bias_results.get('confidence_interval', (np.nan, np.nan))
+        
+        if total_casts == 0:
+            ax.text(0.5, 0.5, 'No perpendicular cast events found', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            return fig
+        
+        # For pooled data, use the larva summaries for box plot if available
+        larva_summaries = bias_results.get('larva_summaries', [])
+        
+        if larva_summaries:
+            # Use per-larva summaries for box plot visualization
+            larva_towards_biases = [summary['towards_bias'] for summary in larva_summaries]
+            larva_away_biases = [summary['away_bias'] for summary in larva_summaries]
+        else:
+            # If no larva summaries, create single point for visualization
+            larva_towards_biases = [pooled_towards_bias]
+            larva_away_biases = [pooled_away_bias]
+    else:
+        # Handle per-larva results (original approach)
+        larva_summaries = bias_results.get('larva_summaries', [])
+        if not larva_summaries:
+            ax.text(0.5, 0.5, 'No larva data available', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            return fig
+        
+        larva_towards_biases = [summary['towards_bias'] for summary in larva_summaries]
+        larva_away_biases = [summary['away_bias'] for summary in larva_summaries]
     
     # Data for box plot with closer spacing
     data = [larva_towards_biases, larva_away_biases]
-    positions = [1, 1.3]  # Reduced spacing from [1, 2] to [1, 1.8]
+    positions = [1, 1.3]  # Reduced spacing
     labels_box = ['Towards Wind', 'Away from Wind']
     
     # Choose color based on analysis type
     analysis_type = bias_results.get('analysis_type', 'first')
     color_map = {
-        'first': '#4B0082',   # Indigo
-        'last': '#800080',    # Purple  
-        'all': '#DA70D6'      # Orchid
+        'turn': '#4B0082',   # Indigo
+        'first': '#663399',  # Rebecca Purple
+        'last': '#9932CC',    # Dark Orchid 
+        'all': '#8A2BE2'      # Blue Violet
     }
     plot_color = color_map.get(analysis_type, '#E53935')
     colors = [plot_color, plot_color]
     
-    # Create box plot
+    # Create box plot with black, thin median line
     bp = ax.boxplot(data, positions=positions, patch_artist=True, 
-                   widths=0.2, showfliers=False,  # Reduced width from 0.4 to 0.3
+                   widths=0.2, showfliers=False,
                    boxprops=dict(linewidth=1.5),
                    whiskerprops=dict(linewidth=1.5),
                    capprops=dict(linewidth=1.5),
-                   medianprops=dict(linewidth=2, color='black'))
+                   medianprops=dict(linewidth=1.5, color='black'))  # Black, normal width median
     
     # Color boxes
     for i, (box, color) in enumerate(zip(bp['boxes'], colors)):
@@ -1946,29 +2373,46 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
             ax.scatter(x_positions, d, color=color, s=10, alpha=0.8, 
                       edgecolors='black', linewidth=0.5, zorder=5)
     
-    # Add mean ± SE text boxes
+    # Add mean ± SE text boxes below the plot
     for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
         if len(d) > 0:
             mean_val = np.mean(d)
             se_val = stats.sem(d)
-            text_str = f"{mean_val:.2f}±{se_val:.2f}"
-            ax.text(pos, -0.1, text_str, ha='center', va='bottom',
-                   fontsize=10, color='black',
+            
+            # Two-line format: Mean on first line, ±SE on second line
+            if is_pooled:
+                # For pooled, show both pooled stats and per-larva mean
+                if i == 0:  # Towards wind
+                    text_str = f"Pooled: {pooled_towards_bias:.2f}\n±{se_val:.2f}"
+                else:  # Away from wind
+                    text_str = f"Pooled: {pooled_away_bias:.2f}\n±{se_val:.2f}"
+            else:
+                text_str = f"Mean:\n{mean_val:.2f}±{se_val:.2f}"
+            
+            ax.text(pos, -0.25, text_str, ha='center', va='bottom',
+                   fontsize=9, color='black',
                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
                             edgecolor='gray', alpha=0.9))
     
-    # Statistical test annotatio
-    if len(larva_towards_biases) > 1 and len(larva_away_biases) > 1:
-        p_wilcoxon = bias_results.get('p_value_wilcoxon', np.nan)
-        p_ttest = bias_results.get('p_value_ttest', np.nan)
-        p_fischer = bias_results.get('p_value_fisher_combined', np.nan)
+    # Statistical test annotation
+    if is_pooled:
+        # For pooled analysis, use binomial test p-value
+        p_value = bias_results.get('p_value_binomial', np.nan)
+        test_name = 'Binomial test'
+    else:
+        # For per-larva analysis, use specified test
         if test == 'ttest':
-            p_value = p_ttest
+            p_value = bias_results.get('p_value_ttest', np.nan)
+            test_name = 't-test'
         elif test == 'fisher':
-            p_value = p_fischer
+            p_value = bias_results.get('p_value_fisher_combined', np.nan)
+            test_name = 'Fisher combined'
         else:
-            p_value = p_wilcoxon
-
+            p_value = bias_results.get('p_value_wilcoxon', np.nan)
+            test_name = 'Wilcoxon test'
+    
+    # Only show comparison line if we have sufficient data for statistical test
+    if len(larva_towards_biases) > 1 and len(larva_away_biases) > 1:
         if not np.isnan(p_value):
             if p_value < 0.001:
                 ptext = "***"
@@ -1990,41 +2434,61 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
     # Add chance level line
     ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7, linewidth=1)
     
-    # Configure plot limits
-    ax.set_ylim(-0.15, 1.15)
-    ax.set_xlim(0.8, 1.6)  # Adjusted for closer spacing
+    # Configure plot limits (no need for extra space for median annotations)
+    ax.set_ylim(-0.3, 1.15)
+    ax.set_xlim(0.7, 1.7)
     
     # Labels and ticks
     ax.set_ylabel('Probability', fontsize=14)
     ax.set_xticks(positions)
-    ax.set_xticklabels(labels_box)  # Reduced from 12 to 10
+    ax.set_xticklabels(labels_box)
     ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_yticklabels(['0.0', '0.2', '0.4', '0.6', '0.8', '1.0'])
-    ax.tick_params(axis='x', which='major', labelsize=10, length=6, rotation=20)  # Smaller x-axis labels
-    ax.tick_params(axis='y', which='major', labelsize=14, length=6)  # Keep y-axis labels large
+    ax.tick_params(axis='x', which='major', labelsize=10, length=6, rotation=20)
+    ax.tick_params(axis='y', which='major', labelsize=14, length=6)
     
     # Style axes - detached appearance
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_bounds(0, 1)
     ax.spines['bottom'].set_bounds(positions[0], positions[1])
-    # ax.spines['left'].set_position(('outward', 20))
     ax.spines['bottom'].set_position(('outward', 2))
     
     # Title
     if title:
         ax.set_title(title, fontsize=14, pad=20)
     else:
-        title_map = {'first': 'First Head Cast Bias', 'last': 'Last Head Cast Bias', 'all': 'All Head Cast Bias'}
-        ax.set_title(title_map.get(analysis_type, "Head Cast Bias"),
-                    fontsize=14, pad=20)
+        title_map = {'turn': 'Turn Bias', 'first': 'First Head Cast Bias', 'last': 'Last Head Cast Bias', 'all': 'All Head Cast Bias'}
+        title_base = title_map.get(analysis_type, "Head Cast Bias")
+        title_suffix = " (Pooled)" if is_pooled else ""
+        ax.set_title(title_base + title_suffix, fontsize=14, pad=20)
     
-    # Sample size in top right
-    n_larvae = bias_results.get('n_larvae', 0)
-    ax.text(0.98, 0.9, f'n={n_larvae}', 
+    # Sample size in top right - simplified format
+    if is_pooled:
+        sample_info = f'n={bias_results.get("total_casts", 0)} events\n({bias_results.get("n_larvae", 0)})'
+    else:
+        sample_info = f'n={bias_results.get("n_larvae", 0)}'
+    
+    ax.text(0.98, 0.9, sample_info, 
            transform=ax.transAxes, fontsize=10, va='top', ha='right',
            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
-    
+    # After calculating larva_towards_biases and larva_away_biases
+    print("\n=== MEDIANS AND QUARTILES ===")
+    if len(larva_towards_biases) > 0:
+        towards_median = np.median(larva_towards_biases)
+        towards_q25 = np.percentile(larva_towards_biases, 25)
+        towards_q75 = np.percentile(larva_towards_biases, 75)
+        print(f"Towards Wind - Median: {towards_median:.3f}, Q1: {towards_q25:.3f}, Q3: {towards_q75:.3f}")
+
+    if len(larva_away_biases) > 0:
+        away_median = np.median(larva_away_biases)
+        away_q25 = np.percentile(larva_away_biases, 25)
+        away_q75 = np.percentile(larva_away_biases, 75)
+        print(f"Away from Wind - Median: {away_median:.3f}, Q1: {away_q25:.3f}, Q3: {away_q75:.3f}")
+
+    if is_pooled:
+        print(f"Pooled towards bias: {pooled_towards_bias:.3f}")
+        print(f"Pooled away bias: {pooled_away_bias:.3f}")
     # Save and display
     if save_path and created_fig:
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
@@ -2035,26 +2499,24 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
         plt.show()
         
         # Print summary
-        analysis_type = bias_results.get('analysis_type', 'first')
-        print(f"\n=== HEAD CAST DIRECTION BIAS ANALYSIS ({analysis_type.upper()}) ===")
-        print(f"Total perpendicular cast events: {bias_results.get('total_casts', 0)}")
-        print(f"Number of larvae: {bias_results.get('n_larvae', 0)}")
-        print(f"Towards wind head casts: {bias_results.get('total_towards', 0)} ({bias_results.get('overall_towards_bias', 0):.1%})")
-        print(f"Away from wind head casts: {bias_results.get('total_away', 0)} ({bias_results.get('overall_away_bias', 0):.1%})")
-        
-        p_wilcoxon = bias_results.get('p_value_wilcoxon', np.nan)
-        if not np.isnan(p_wilcoxon):
-            print(f"Wilcoxon signed-rank test p-value: {p_wilcoxon:.4f}")
-            
-            if p_wilcoxon < 0.05:
-                bias_direction = "towards wind" if bias_results.get('mean_larva_towards_bias', 0) > 0.5 else "away from wind"
-                print(f"RESULT: Significant bias toward {bias_direction} head casts (p < 0.05)")
-            else:
-                print("RESULT: No significant bias detected (p ≥ 0.05)")
+        if is_pooled:
+            print(f"\n=== HEAD CAST DIRECTION BIAS ANALYSIS ({analysis_type.upper()}, POOLED) ===")
+            print(f"Total perpendicular cast events: {bias_results.get('total_casts', 0)}")
+            print(f"Number of larvae: {bias_results.get('n_larvae', 0)}")
+            print(f"Towards wind: {bias_results.get('total_towards', 0)} ({bias_results.get('pooled_towards_bias', 0):.1%})")
+            print(f"Away from wind: {bias_results.get('total_away', 0)} ({bias_results.get('pooled_away_bias', 0):.1%})")
+            print(f"95% CI for towards bias: [{confidence_interval.low:.1%}, {confidence_interval.high:.1%}]")
+            print(f"Binomial test p-value: {bias_results.get('p_value_binomial', np.nan):.4f}")
         else:
-            print("RESULT: Statistical testing not performed (insufficient data)")
+            print(f"\n=== HEAD CAST DIRECTION BIAS ANALYSIS ({analysis_type.upper()}, PER-LARVA) ===")
+            print(f"Total perpendicular cast events: {bias_results.get('total_casts', 0)}")
+            print(f"Number of larvae: {bias_results.get('n_larvae', 0)}")
+            print(f"Towards wind: {bias_results.get('total_towards', 0)} ({bias_results.get('overall_towards_bias', 0):.1%})")
+            print(f"Away from wind: {bias_results.get('total_away', 0)} ({bias_results.get('overall_away_bias', 0):.1%})")
+            print(f"Wilcoxon test p-value: {bias_results.get('p_value_wilcoxon', np.nan):.4f}")
     
     return fig
+
 #### NAVIGATIONAL INDEX CALCULATION ####
 def plot_navigational_index_over_time(ni_time_results, figsize=(8, 6), save_path=None, 
                                      show_individuals=False, show_error=True, ax=None):
@@ -2557,139 +3019,115 @@ Per-experiment n: {', '.join([f"{date}: {len(per_date_ni_x.get(date, []))}" for 
     
     return fig
 
-def plot_navigational_index_time_series_combined(result_files, figsize=(12, 6), save_path=None):
+def plot_ni_boxplot_by_date(combined_ni_single, save_path=None):
     """
-    Plot combined NI time series data across multiple experiment dates.
-    Shows overall mean with SEM and individual experiment means.
+    Plot boxplot of NI values showing both combined data and individual dates.
     
     Args:
-        result_files: List of HDF5 file paths from different experiments
-        figsize: Figure size
-        save_path: Optional path to save figure
-        
+        combined_ni_single: Combined NI single results with date information
+        save_path: Optional path to save the figure
+    
     Returns:
         Figure object
     """
     import matplotlib.pyplot as plt
     import numpy as np
     
-    # Load and extract time series data from all files
-    all_time_data = []
-    experiment_dates = []
-    per_date_time_data = {}
-    common_time_centers = None
-    
-    for filepath in result_files:
-        try:
-            results = data_loader.load_analysis_results(filepath)
-            
-            # Extract experiment date from path
-            path_parts = filepath.split('/')
-            experiment_date = 'unknown'
-            for part in path_parts:
-                if len(part) == 15 and part.startswith('202'):
-                    experiment_date = part[:8]
-                    break
-            
-            if 'ni_time_results' in results:
-                ni_time_data = results['ni_time_results']
-                time_centers = ni_time_data.get('time_centers', [])
-                mean_NI_x = ni_time_data.get('mean_NI_x', [])
-                mean_NI_y = ni_time_data.get('mean_NI_y', [])
-                
-                if len(mean_NI_x) > 0 and len(mean_NI_y) > 0:
-                    if common_time_centers is None:
-                        common_time_centers = time_centers
-                    
-                    all_time_data.append({
-                        'date': experiment_date,
-                        'time_centers': time_centers,
-                        'mean_NI_x': mean_NI_x,
-                        'mean_NI_y': mean_NI_y
-                    })
-                    
-                    if experiment_date not in per_date_time_data:
-                        per_date_time_data[experiment_date] = []
-                        experiment_dates.append(experiment_date)
-                    
-                    per_date_time_data[experiment_date].append({
-                        'mean_NI_x': mean_NI_x,
-                        'mean_NI_y': mean_NI_y
-                    })
-                    
-        except Exception as e:
-            print(f"⚠️  Could not load time series data from {filepath}: {e}")
-    
-    if not all_time_data:
-        print("No time series data found!")
+    if not combined_ni_single or 'NI_x_by_date' not in combined_ni_single:
+        print("⚠️  No NI data by date available for plotting")
         return None
     
-    # Create figure
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
-    # Combine all experiments for overall means
-    all_ni_x_means = []
-    all_ni_y_means = []
+    # Get data
+    ni_x_by_date = combined_ni_single['NI_x_by_date']
+    ni_y_by_date = combined_ni_single['NI_y_by_date']
+    combined_ni_x = combined_ni_single['NI_x_clean']
+    combined_ni_y = combined_ni_single['NI_y_clean']
     
-    for data in all_time_data:
-        all_ni_x_means.append(data['mean_NI_x'])
-        all_ni_y_means.append(data['mean_NI_y'])
+    # Sort dates for consistent ordering
+    sorted_dates = sorted(ni_x_by_date.keys())
     
-    # Calculate overall statistics
-    overall_mean_x = np.nanmean(all_ni_x_means, axis=0)
-    overall_mean_y = np.nanmean(all_ni_y_means, axis=0)
-    overall_sem_x = stats.sem(all_ni_x_means, axis=0, nan_policy='omit')
-    overall_sem_y = stats.sem(all_ni_y_means, axis=0, nan_policy='omit')
+    # Prepare data for boxplot - NI_x
+    ni_x_data = [combined_ni_x]  # Combined data first
+    ni_x_labels = ['Combined']
     
-    # Plot NI_x time series
-    # Individual experiments (light lines)
-    for data in all_time_data:
-        ax1.plot(data['time_centers'], data['mean_NI_x'], 
-                color='blue', alpha=0.3, linewidth=1)
+    for date in sorted_dates:
+        if date in ni_x_by_date and len(ni_x_by_date[date]) > 0:
+            ni_x_data.append(ni_x_by_date[date])
+            # Format date for display (show just the date part)
+            date_short = date.split('_')[0] if '_' in date else date
+            ni_x_labels.append(date_short)
     
-    # Overall mean with SEM
-    ax1.plot(common_time_centers, overall_mean_x, 
-            color='blue', linewidth=3, label='Overall Mean')
-    ax1.fill_between(common_time_centers, 
-                    overall_mean_x - overall_sem_x, 
-                    overall_mean_x + overall_sem_x,
-                    color='blue', alpha=0.3, label='Overall ± SEM')
+    # Prepare data for boxplot - NI_y
+    ni_y_data = [combined_ni_y]  # Combined data first
+    ni_y_labels = ['Combined']
     
-    # Plot NI_y time series
-    # Individual experiments (light lines)
-    for data in all_time_data:
-        ax2.plot(data['time_centers'], data['mean_NI_y'], 
-                color='red', alpha=0.3, linewidth=1)
+    for date in sorted_dates:
+        if date in ni_y_by_date and len(ni_y_by_date[date]) > 0:
+            ni_y_data.append(ni_y_by_date[date])
+            # Format date for display
+            date_short = date.split('_')[0] if '_' in date else date
+            ni_y_labels.append(date_short)
     
-    # Overall mean with SEM
-    ax2.plot(common_time_centers, overall_mean_y, 
-            color='red', linewidth=3, label='Overall Mean')
-    ax2.fill_between(common_time_centers, 
-                    overall_mean_y - overall_sem_y, 
-                    overall_mean_y + overall_sem_y,
-                    color='red', alpha=0.3, label='Overall ± SEM')
+    # Plot NI_x
+    bp1 = ax1.boxplot(ni_x_data, labels=ni_x_labels, patch_artist=True)
+    ax1.set_ylabel('NI_x')
+    ax1.set_title('NI_x Distribution by Date')
+    ax1.axhline(y=0, color='red', linestyle='--', alpha=0.7, linewidth=1)
     
-    # Formatting for both subplots
-    for ax, title, ylabel in [(ax1, 'NI_x Over Time', 'NI_x'), 
-                              (ax2, 'NI_y Over Time', 'NI_y')]:
-        ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.set_ylim(-0.5, 0.5)
-        ax.grid(False)
-        ax.legend()
+    # Color NI_x boxes: dark blue for combined, light blue for individual dates
+    bp1['boxes'][0].set_facecolor('darkblue')
+    bp1['boxes'][0].set_alpha(0.8)
+    for i in range(1, len(bp1['boxes'])):
+        bp1['boxes'][i].set_facecolor('lightblue')
+        bp1['boxes'][i].set_alpha(0.7)
     
-    n_experiments = len(experiment_dates)
-    fig.suptitle(f'Navigational Index Time Series\n'
-                f'{n_experiments} experiments: {", ".join(sorted(experiment_dates))}', 
-                fontsize=14, y=0.95)
+    # Rotate x-axis labels if too many dates
+    if len(ni_x_labels) > 6:
+        ax1.tick_params(axis='x', rotation=45)
     
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to {save_path}")
+    # Plot NI_y
+    bp2 = ax2.boxplot(ni_y_data, labels=ni_y_labels, patch_artist=True)
+    ax2.set_ylabel('NI_y')
+    ax2.set_title('NI_y Distribution by Date')
+    ax2.axhline(y=0, color='red', linestyle='--', alpha=0.7, linewidth=1)
+    
+    # Color NI_y boxes: dark red for combined, light red for individual dates
+    bp2['boxes'][0].set_facecolor('darkred')
+    bp2['boxes'][0].set_alpha(0.8)
+    for i in range(1, len(bp2['boxes'])):
+        bp2['boxes'][i].set_facecolor('lightcoral')
+        bp2['boxes'][i].set_alpha(0.7)
+    
+    # Rotate x-axis labels if too many dates
+    if len(ni_y_labels) > 6:
+        ax2.tick_params(axis='x', rotation=45)
+    
+    # Add significance annotations for combined data
+    if 'significances' in combined_ni_single:
+        sig_x = combined_ni_single['significances']['NI_x']
+        sig_y = combined_ni_single['significances']['NI_y']
+        
+        if sig_x != 'insufficient data':
+            ax1.text(1, max(combined_ni_x) * 0.9, f'p {sig_x}', 
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        if sig_y != 'insufficient data':
+            ax2.text(1, max(combined_ni_y) * 0.9, f'p {sig_y}', 
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    # Add sample size information
+    n_total = len(combined_ni_x)
+    fig.suptitle(f'Navigational Index by Date (n={n_total} total larvae)', fontsize=14)
     
     plt.tight_layout()
-    plt.show()
+    
+    if save_path:
+        fig.savefig(save_path, bbox_inches='tight', dpi=300, transparent=True, facecolor='none')
+        print(f"NI boxplot by date saved to: {save_path}")
     
     return fig
+
+
+

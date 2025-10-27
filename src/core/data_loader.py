@@ -4,6 +4,8 @@ import h5py
 import numpy as np
 from tqdm.notebook import tqdm
 import multiprocessing as mp
+import glob
+import scipy.stats as stats
 
 def get_behavior_data(f, field, i):
     """Extract behavior-related cell arrays from MATLAB struct.
@@ -202,8 +204,6 @@ def load_single_trx_file(file_path, show_progress=False):
             'data': {},
             'metadata': {'error': error_msg, 'file_path': file_path}
         }
-
-
 
 def process_single_file(file_path, show_progress=False):
     """Process a single trx.mat file containing larval tracking data.
@@ -463,76 +463,461 @@ def save_analysis_results(output_dir, single_path, trx_filtered_by_merging, **re
     return filepath
 
 def load_analysis_results(filepath):
-    """
-    Load analysis results from an HDF5 file.
-    
-    Args:
-        filepath: Path to the HDF5 file
-        
-    Returns:
-        Dictionary containing all the analysis results
-    """
-    def load_group_recursively(group):
-        """Recursively load data from HDF5 group."""
-        result = {}
-        
-        # Load attributes
-        for attr_name, attr_value in group.attrs.items():
-            result[attr_name] = attr_value
-        
-        # Load datasets and subgroups
-        for key, item in group.items():
-            if isinstance(item, h5py.Dataset):
-                result[key] = np.array(item)
-            elif isinstance(item, h5py.Group):
-                # Check if this is a special structured group
-                entry_type = item.attrs.get('entry_type', None)
-                
-                if entry_type == 'dict_list':
-                    # Reconstruct list of dictionaries
-                    n_entries = item.attrs['n_entries']
-                    result[key] = []
-                    for i in range(n_entries):
-                        entry_group = item[f'entry_{i}']
-                        result[key].append(load_group_recursively(entry_group))
-                        
-                elif entry_type == 'array_list':
-                    # Reconstruct list of arrays
-                    n_arrays = item.attrs['n_arrays']
-                    result[key] = []
-                    for i in range(n_arrays):
-                        if f'array_{i}' in item:
-                            result[key].append(np.array(item[f'array_{i}']))
-                        
-                elif entry_type in ['object_array', 'mixed_data']:
-                    # Reconstruct object array or mixed data
-                    n_arrays = item.attrs['n_arrays']
-                    result[key] = []
-                    for i in range(n_arrays):
-                        array_key = f'array_{i}'
-                        dict_key = f'dict_{i}'
-                        if array_key in item:
-                            result[key].append(np.array(item[array_key]))
-                        elif dict_key in item:
-                            result[key].append(load_group_recursively(item[dict_key]))
-                else:
-                    # Regular nested group
-                    result[key] = load_group_recursively(item)
-        
-        return result
+    """Load analysis results from HDF5 file."""
+    results = {}
     
     with h5py.File(filepath, 'r') as f:
         # Load metadata
-        metadata = {}
-        for attr_name, attr_value in f.attrs.items():
-            metadata[attr_name] = attr_value
+        metadata = dict(f.attrs)
+        results['metadata'] = metadata
         
-        # Load all analysis results
-        results = {}
-        for result_name, group in f.items():
-            print(f"📖 Loading {result_name}...")
-            results[result_name] = load_group_recursively(group)
-        
-        results['_metadata'] = metadata
-        
+        # Load each analysis result group
+        for group_name in f.keys():
+            group = f[group_name]
+            result_dict = {}
+            
+            # Load attributes (scalars)
+            for attr_name, attr_value in group.attrs.items():
+                result_dict[attr_name] = attr_value
+            
+            # Load datasets (arrays)
+            for dataset_name in group.keys():
+                if isinstance(group[dataset_name], h5py.Group):
+                    # Handle arrays of arrays (inhomogeneous data)
+                    subgroup = group[dataset_name]  # FIXED: Remove typo
+                    entry_type = subgroup.attrs.get('entry_type', None)
+                    
+                    if entry_type == 'dict_list':
+                        # Reconstruct list of dictionaries
+                        n_entries = subgroup.attrs['n_entries']
+                        result_dict[dataset_name] = []
+                        for i in range(n_entries):
+                            if f'entry_{i}' in subgroup:
+                                entry_group = subgroup[f'entry_{i}']
+                                entry_data = {}
+                                # Load all attributes and datasets from this entry
+                                for attr_name, attr_value in entry_group.attrs.items():
+                                    entry_data[attr_name] = attr_value
+                                for sub_key, sub_item in entry_group.items():
+                                    if isinstance(sub_item, h5py.Dataset):
+                                        entry_data[sub_key] = np.array(sub_item)
+                                result_dict[dataset_name].append(entry_data)
+                    
+                    elif entry_type in ['array_list', 'object_array', 'mixed_data']:
+                        # Handle other special cases
+                        n_arrays = subgroup.attrs.get('n_arrays', len(subgroup.keys()))
+                        arrays = []
+                        for i in range(n_arrays):
+                            if f'array_{i}' in subgroup:
+                                arrays.append(subgroup[f'array_{i}'][:])
+                            else:
+                                arrays.append(None)  # Handle missing arrays
+                        result_dict[dataset_name] = arrays
+                    
+                    else:
+                        # Regular nested group - recurse
+                        nested_result = {}
+                        for attr_name, attr_value in subgroup.attrs.items():
+                            nested_result[attr_name] = attr_value
+                        for sub_key, sub_item in subgroup.items():
+                            if isinstance(sub_item, h5py.Dataset):
+                                nested_result[sub_key] = np.array(sub_item)
+                        result_dict[dataset_name] = nested_result
+                else:
+                    # Regular homogeneous array
+                    result_dict[dataset_name] = group[dataset_name][:]
+            
+            results[group_name] = result_dict
+    
     return results
+
+
+def combine_analysis_results(result_files, analysis_type):
+    """
+    Combine multiple analysis results of the same type.
+    
+    Args:
+        result_files: List of HDF5 file paths
+        analysis_type: Type of analysis to combine (e.g., 'run_prob_results')
+    
+    Returns:
+        Combined analysis results
+    """
+    all_hist_arrays = []
+    all_metric_arrays = []
+    all_ni_x_values = []  # For NI single x values
+    all_ni_y_values = []  # For NI single y values
+    all_ni_x_time_series = []  # For NI time series x
+    all_ni_y_time_series = []  # For NI time series y
+    all_larva_summaries = []  # For larva-level bias summaries
+    
+    # NEW: Store NI values by date for plotting
+    ni_x_by_date = {}  # {date: [NI_x_values]}
+    ni_y_by_date = {}  # {date: [NI_y_values]}
+    
+    bin_centers = None
+    time_centers = None
+    orientation_bins = None
+    n_larvae_total = 0
+    
+    # Special handling for different analysis types
+    is_bias_analysis = 'bias_results' in analysis_type
+    is_ni_single = analysis_type == 'ni_single_results'
+    is_ni_time = analysis_type == 'ni_time_results'
+    is_head_cast = 'head_cast' in analysis_type and 'bias' not in analysis_type
+    
+    for filepath in result_files:
+        try:
+            results = load_analysis_results(filepath)
+            
+            if analysis_type not in results:
+                continue
+                
+            data = results[analysis_type]
+            n_larvae_total += data.get('n_larvae', 0)
+            
+            # Extract experiment date from filepath
+            experiment_date = 'unknown'
+            path_parts = filepath.split('/')
+            for part in path_parts:
+                if len(part) == 15 and part.startswith('202'):  # Format: 20240226_145653
+                    experiment_date = part
+                    break
+            
+            # Get common axes
+            if bin_centers is None and 'bin_centers' in data:
+                bin_centers = data['bin_centers']
+            if time_centers is None and 'time_centers' in data:
+                time_centers = data['time_centers']
+            if orientation_bins is None and 'orientation_bins' in data:
+                orientation_bins = data['orientation_bins']
+            
+            # Handle different data structures based on analysis type
+            if is_bias_analysis:
+                # Head cast bias data - collect larva summaries
+                if 'larva_summaries' in data and data['larva_summaries'] is not None:
+                    # Filter out None values and extend the list of larva summaries
+                    valid_summaries = [s for s in data['larva_summaries'] if s is not None]
+                    all_larva_summaries.extend(valid_summaries)
+                            
+            elif is_ni_single:
+                # NI single values - collect individual NI values per larva AND by date
+                if 'NI_x_clean' in data and len(data['NI_x_clean']) > 0:
+                    ni_x_values = data['NI_x_clean']
+                    all_ni_x_values.extend(ni_x_values)
+                    # Store by date
+                    if experiment_date not in ni_x_by_date:
+                        ni_x_by_date[experiment_date] = []
+                    ni_x_by_date[experiment_date].extend(ni_x_values)
+                    
+                if 'NI_y_clean' in data and len(data['NI_y_clean']) > 0:
+                    ni_y_values = data['NI_y_clean']
+                    all_ni_y_values.extend(ni_y_values)
+                    # Store by date
+                    if experiment_date not in ni_y_by_date:
+                        ni_y_by_date[experiment_date] = []
+                    ni_y_by_date[experiment_date].extend(ni_y_values)
+                    
+            elif is_ni_time:
+                # NI time series - collect arrays for each larva
+                if 'NI_x_arrays' in data and data['NI_x_arrays'] is not None:
+                    ni_x_arrays = np.array(data['NI_x_arrays'])
+                    if len(ni_x_arrays.shape) == 2:  # Ensure 2D (n_larvae, n_time_bins)
+                        all_ni_x_time_series.append(ni_x_arrays)
+                        
+                if 'NI_y_arrays' in data and data['NI_y_arrays'] is not None:
+                    ni_y_arrays = np.array(data['NI_y_arrays'])
+                    if len(ni_y_arrays.shape) == 2:  # Ensure 2D (n_larvae, n_time_bins)
+                        all_ni_y_time_series.append(ni_y_arrays)
+                        
+            else:
+                # Standard histogram/metric data (run prob, turn prob, velocity, turn amp, head cast, backup)
+                if 'hist_arrays' in data and len(data['hist_arrays']) > 0:
+                    hist_arrays = np.array(data['hist_arrays'])
+                    if len(hist_arrays.shape) == 2:
+                        all_hist_arrays.append(hist_arrays)
+                        
+                if 'metric_arrays' in data and len(data['metric_arrays']) > 0:
+                    metric_arrays = np.array(data['metric_arrays'])
+                    if len(metric_arrays.shape) == 2:
+                        all_metric_arrays.append(metric_arrays)
+                        
+        except Exception as e:
+            print(f"⚠️  Error processing {filepath} for {analysis_type}: {e}")
+            continue
+    
+    # Combine all arrays based on data type
+    combined_result = {}
+    
+    # Standard histogram data
+    if all_hist_arrays:
+        combined_hist_arrays = np.concatenate(all_hist_arrays, axis=0)
+        combined_result.update({
+            'hist_arrays': combined_hist_arrays,
+            'mean_hist': np.nanmean(combined_hist_arrays, axis=0),
+            'se_hist': stats.sem(combined_hist_arrays, axis=0, nan_policy='omit'),
+            'bin_centers': bin_centers,
+            'n_larvae': len(combined_hist_arrays)
+        })
+    
+    # Time series metric data
+    if all_metric_arrays:
+        combined_metric_arrays = np.concatenate(all_metric_arrays, axis=0)
+        combined_result.update({
+            'metric_arrays': combined_metric_arrays,
+            'mean_metric': np.nanmean(combined_metric_arrays, axis=0),
+            'se_metric': stats.sem(combined_metric_arrays, axis=0, nan_policy='omit'),
+            'time_centers': time_centers,
+            'n_larvae': len(combined_metric_arrays)
+        })
+    
+    # Head cast bias analysis - Fixed version
+    # Head cast bias analysis - CORRECTED version
+    if all_larva_summaries:
+        # Recalculate combined statistics from all larva summaries
+        combined_towards_biases = []
+        combined_away_biases = []
+        
+        for summary in all_larva_summaries:
+            if summary is not None and isinstance(summary, dict):
+                if 'towards_bias' in summary and summary['towards_bias'] is not None and not np.isnan(summary['towards_bias']):
+                    combined_towards_biases.append(summary['towards_bias'])
+                if 'away_bias' in summary and summary['away_bias'] is not None and not np.isnan(summary['away_bias']):
+                    combined_away_biases.append(summary['away_bias'])
+
+        # Calculate totals from larva summaries
+        total_towards = sum(summary.get('towards_count', 0) for summary in all_larva_summaries
+                        if summary is not None and isinstance(summary, dict))
+        total_away = sum(summary.get('away_count', 0) for summary in all_larva_summaries
+                    if summary is not None and isinstance(summary, dict))
+        total_casts = total_towards + total_away
+        overall_towards_bias = total_towards / total_casts if total_casts > 0 else np.nan
+        overall_away_bias = total_away / total_casts if total_casts > 0 else np.nan
+        
+        # CORRECTED Statistical tests
+        from scipy.stats import ttest_1samp, wilcoxon
+        
+        if len(combined_towards_biases) >= 3:  # Need at least 3 for meaningful test
+            # Test 1: One-sample t-test against 0.5 (chance level)
+            t_stat_ttest, p_value_ttest = ttest_1samp(combined_towards_biases, 0.5)
+            
+            # Test 2: Wilcoxon signed-rank test against 0.5 (non-parametric)
+            deviations_from_chance = np.array(combined_towards_biases) - 0.5
+            if np.any(deviations_from_chance != 0):
+                w_stat, p_value_wilcoxon = wilcoxon(deviations_from_chance, alternative='two-sided')
+            else:
+                p_value_wilcoxon = 1.0
+        else:
+            p_value_ttest = np.nan
+            p_value_wilcoxon = np.nan
+        
+        # Per-larva statistics
+        mean_larva_towards_bias = np.nanmean(combined_towards_biases) if combined_towards_biases else np.nan
+        se_larva_towards_bias = stats.sem(combined_towards_biases, nan_policy='omit') if combined_towards_biases else np.nan
+        mean_larva_away_bias = np.nanmean(combined_away_biases) if combined_away_biases else np.nan
+        se_larva_away_bias = stats.sem(combined_away_biases, nan_policy='omit') if combined_away_biases else np.nan
+        
+        combined_result.update({
+            'larva_summaries': all_larva_summaries,
+            'total_towards': total_towards,
+            'total_away': total_away,
+            'total_casts': total_casts,
+            'overall_towards_bias': overall_towards_bias,
+            'overall_away_bias': overall_away_bias,
+            'mean_larva_towards_bias': mean_larva_towards_bias,
+            'se_larva_towards_bias': se_larva_towards_bias,
+            'mean_larva_away_bias': mean_larva_away_bias,
+            'se_larva_away_bias': se_larva_away_bias,
+            'p_value_wilcoxon': p_value_wilcoxon,
+            'p_value_ttest': p_value_ttest,
+            'n_larvae': len([s for s in all_larva_summaries if s is not None]),
+            'analysis_type': analysis_type.split('_')[-1] if '_' in analysis_type else 'all'
+        })
+    
+    # NI single values - ENHANCED with date preservation
+    if all_ni_x_values or all_ni_y_values:
+        combined_ni_x = np.array(all_ni_x_values) if all_ni_x_values else np.array([])
+        combined_ni_y = np.array(all_ni_y_values) if all_ni_y_values else np.array([])
+        
+        # Remove NaN values
+        combined_ni_x = combined_ni_x[~np.isnan(combined_ni_x)] if len(combined_ni_x) > 0 else combined_ni_x
+        combined_ni_y = combined_ni_y[~np.isnan(combined_ni_y)] if len(combined_ni_y) > 0 else combined_ni_y
+        
+        # Clean NI values by date (remove NaNs)
+        ni_x_by_date_clean = {}
+        ni_y_by_date_clean = {}
+        
+        for date, values in ni_x_by_date.items():
+            clean_values = np.array(values)
+            clean_values = clean_values[~np.isnan(clean_values)]
+            if len(clean_values) > 0:
+                ni_x_by_date_clean[date] = clean_values
+                
+        for date, values in ni_y_by_date.items():
+            clean_values = np.array(values)
+            clean_values = clean_values[~np.isnan(clean_values)]
+            if len(clean_values) > 0:
+                ni_y_by_date_clean[date] = clean_values
+        
+        combined_result.update({
+            'NI_x_clean': combined_ni_x,
+            'NI_y_clean': combined_ni_y,
+            'NI_x_by_date': ni_x_by_date_clean,  # NEW: NI_x values grouped by date
+            'NI_y_by_date': ni_y_by_date_clean,  # NEW: NI_y values grouped by date
+            'means': {
+                'NI_x': np.nanmean(combined_ni_x) if len(combined_ni_x) > 0 else np.nan,
+                'NI_y': np.nanmean(combined_ni_y) if len(combined_ni_y) > 0 else np.nan
+            },
+            'n_larvae': n_larvae_total
+        })
+        
+        # Add significance testing
+        def test_significance(values, test_value=0):
+            if len(values) < 3:
+                return np.nan, "insufficient data"
+            t_stat, p_value = stats.ttest_1samp(values, test_value)
+            if p_value < 0.001:
+                return p_value, "***"
+            elif p_value < 0.01:
+                return p_value, "**"
+            elif p_value < 0.05:
+                return p_value, "*"
+            else:
+                return p_value, "ns"
+        
+        p_x, sig_x = test_significance(combined_ni_x) if len(combined_ni_x) > 0 else (np.nan, "insufficient data")
+        p_y, sig_y = test_significance(combined_ni_y) if len(combined_ni_y) > 0 else (np.nan, "insufficient data")
+        
+        combined_result.update({
+            'p_values': {'NI_x': p_x, 'NI_y': p_y},
+            'significances': {'NI_x': sig_x, 'NI_y': sig_y}
+        })
+    
+    # NI time series data
+    if all_ni_x_time_series or all_ni_y_time_series:
+        if all_ni_x_time_series:
+            combined_ni_x_time = np.concatenate(all_ni_x_time_series, axis=0)
+            mean_ni_x_time = np.nanmean(combined_ni_x_time, axis=0)
+            se_ni_x_time = stats.sem(combined_ni_x_time, axis=0, nan_policy='omit')
+        else:
+            combined_ni_x_time = np.array([])
+            mean_ni_x_time = np.array([])
+            se_ni_x_time = np.array([])
+            
+        if all_ni_y_time_series:
+            combined_ni_y_time = np.concatenate(all_ni_y_time_series, axis=0)
+            mean_ni_y_time = np.nanmean(combined_ni_y_time, axis=0)
+            se_ni_y_time = stats.sem(combined_ni_y_time, axis=0, nan_policy='omit')
+        else:
+            combined_ni_y_time = np.array([])
+            mean_ni_y_time = np.array([])
+            se_ni_y_time = np.array([])
+        
+        combined_result.update({
+            'NI_x_arrays': combined_ni_x_time,
+            'NI_y_arrays': combined_ni_y_time,
+            'mean_NI_x': mean_ni_x_time,
+            'mean_NI_y': mean_ni_y_time,
+            'se_NI_x': se_ni_x_time,
+            'se_NI_y': se_ni_y_time,
+            'time_centers': time_centers,
+            'n_larvae': n_larvae_total
+        })
+    
+    # Add common elements
+    if bin_centers is not None:
+        combined_result['bin_centers'] = bin_centers
+    if time_centers is not None:
+        combined_result['time_centers'] = time_centers
+    if orientation_bins is not None:
+        combined_result['orientation_bins'] = orientation_bins
+    
+    # Add total larvae count if not already added
+    if 'n_larvae' not in combined_result:
+        combined_result['n_larvae'] = n_larvae_total
+    
+    return combined_result if combined_result else None
+
+def get_latest_analysis_files(experiment_dates, base_path=None):
+    """
+    Get the latest analysis .h5 files for given experiment dates.
+    
+    Args:
+        experiment_dates: List of experiment dates (e.g., ['20240219_143334', '20240223_112627'])
+        base_path: Base path to the data directory (optional)
+    
+    Returns:
+        List of paths to the latest .h5 files for each date
+    """
+    if base_path is None:
+        base_path = '/Users/sharbat/Projects/anemotaxis/data/FCF_attP2-40@UAS_TNT_2_0003/p_5gradient2_2s1x600s0s#n#n#n'
+    
+    result_files = []
+    
+    for date in experiment_dates:
+        # Construct the analyses directory path
+        analyses_dir = os.path.join(base_path, date, 'analyses')
+        
+        if not os.path.exists(analyses_dir):
+            print(f"⚠️  Warning: Directory not found for {date}: {analyses_dir}")
+            continue
+        
+        # Find all .h5 files with analysis_results pattern
+        pattern = os.path.join(analyses_dir, 'analysis_results_*.h5')
+        h5_files = glob.glob(pattern)
+        
+        if not h5_files:
+            print(f"⚠️  Warning: No .h5 files found for {date}")
+            continue
+        
+        # Sort by filename (timestamp is in filename) and get the latest
+        h5_files.sort()
+        latest_file = h5_files[-1]
+        result_files.append(latest_file)
+        
+        # Extract timestamp from filename for confirmation
+        filename = os.path.basename(latest_file)
+        timestamp = filename.replace('analysis_results_', '').replace('.h5', '')
+        print(f"✅ {date}: Using latest file with timestamp {timestamp}")
+    
+    return result_files
+
+# Function to load and combine data for a single genotype
+def load_genotype_data(genotype_key, genotype_config):
+    """Load and combine analysis results for a single genotype."""
+    print(f"🔄 Loading {genotype_config['label']} dataset...")
+    
+    result_files = get_latest_analysis_files(
+        genotype_config['experiment_dates'], 
+        base_path=genotype_config['base_path']
+    )
+    
+    # Combine all analysis types
+    combined_data = {}
+    analysis_types = [
+        'run_prob_results', 'run_prob_time_results',
+        'turn_prob_results', 'turn_prob_time_results',
+        'velocity_results', 'velocity_time_results',
+        'backup_prob_results', 'backup_prob_time_results',
+        'bias_results_first', 'bias_results_turn',
+        'turn_amp_results', 'turn_amp_time_results',
+        'head_cast_orientation_results', 'head_cast_time_results',
+        'ni_single_results', 'ni_time_results'
+    ]
+    
+    for analysis_type in analysis_types:
+        combined_data[analysis_type] = combine_analysis_results(result_files, analysis_type)
+    
+    # Add metadata
+    combined_data['metadata'] = {
+        'genotype': genotype_config['name'],
+        'label': genotype_config['label'],
+        'n_files': len(result_files),
+        'n_larvae': combined_data['run_prob_results']['n_larvae'] if combined_data['run_prob_results'] else 0,
+        'style': {
+            'linestyle': genotype_config['linestyle'],
+            'se_alpha': genotype_config['alpha']
+        }
+    }
+    
+    return combined_data
