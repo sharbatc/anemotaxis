@@ -2258,7 +2258,7 @@ def plot_cast_detection_results(experiments_data, cast_events_data, larva_ids=No
     
 #     return fig
 
-def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test='binomial'):
+def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=None, ax=None, title=None, test='binomial', plot_type = 'box'):
     """
     Plot analysis of head cast bias when larvae are perpendicular to flow.
     Shows bias towards upstream vs downstream using box plots with individual data points.
@@ -2351,27 +2351,39 @@ def plot_head_cast_bias_perpendicular(bias_results, figsize=(4, 6), save_path=No
     }
     plot_color = color_map.get(analysis_type, '#E53935')
     colors = [plot_color, plot_color]
-    
-    # Create box plot with black, thin median line
-    bp = ax.boxplot(data, positions=positions, patch_artist=True, 
-                   widths=0.2, showfliers=False,
-                   boxprops=dict(linewidth=1.5),
-                   whiskerprops=dict(linewidth=1.5),
-                   capprops=dict(linewidth=1.5),
-                   medianprops=dict(linewidth=1.5, color='black'))  # Black, normal width median
-    
-    # Color boxes
-    for i, (box, color) in enumerate(zip(bp['boxes'], colors)):
-        box.set(facecolor=color, alpha=0.7, edgecolor='black', linewidth=1.5)
-    
-    # Add individual data points with jitter
-    np.random.seed(42)
-    for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
-        if len(d) > 0:
-            jitter = np.random.uniform(-0.05, 0.05, len(d))  # Reduced jitter
-            x_positions = [pos + j for j in jitter]
-            ax.scatter(x_positions, d, color=color, s=10, alpha=0.8, 
-                      edgecolors='black', linewidth=0.5, zorder=5)
+    if plot_type == 'violin':
+        parts = ax.violinplot(data, positions=positions, widths=0.2, showmeans=False, showmedians=True, showextrema=True)
+        for i, pc in enumerate(parts['bodies']):
+            pc.set_facecolor(colors[i])
+            pc.set_alpha(0.7)
+            pc.set_edgecolor('black')
+            pc.set_linewidth(1.5)
+        # Median line (set directly)
+        if 'cmedians' in parts:
+            parts['cmedians'].set_color('black')
+            parts['cmedians'].set_linewidth(2)
+
+    else:
+        # Create box plot with black, thin median line
+        bp = ax.boxplot(data, positions=positions, patch_artist=True, 
+                    widths=0.2, showfliers=False,
+                    boxprops=dict(linewidth=1.5),
+                    whiskerprops=dict(linewidth=1.5),
+                    capprops=dict(linewidth=1.5),
+                    medianprops=dict(linewidth=1.5, color='black'))  # Black, normal width median
+        
+        # Color boxes
+        for i, (box, color) in enumerate(zip(bp['boxes'], colors)):
+            box.set(facecolor=color, alpha=0.7, edgecolor='black', linewidth=1.5)
+        
+        # Add individual data points with jitter
+        np.random.seed(42)
+        for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
+            if len(d) > 0:
+                jitter = np.random.uniform(-0.05, 0.05, len(d))  # Reduced jitter
+                x_positions = [pos + j for j in jitter]
+                ax.scatter(x_positions, d, color=color, s=10, alpha=0.8, 
+                        edgecolors='black', linewidth=0.5, zorder=5)
     
     # Add mean ± SE text boxes below the plot
     for i, (pos, d, color) in enumerate(zip(positions, data, colors)):
